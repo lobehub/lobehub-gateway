@@ -292,6 +292,17 @@ func (o *operation) handleResume(conn *operationConnection, lastEventID string) 
 	for _, payload := range payloads {
 		_ = conn.writeRaw(payload)
 	}
+
+	// Authoritative resume_complete status (LOBE-10443) — tells the client
+	// the definitive session status after event replay, so it never guesses
+	// "completed" from silence.
+	o.mu.RLock()
+	status := o.record.Status
+	o.mu.RUnlock()
+	_ = conn.writeJSON(map[string]any{
+		"type":   "resume_complete",
+		"status": string(status),
+	})
 }
 
 func (o *operation) bufferLocked(id string, msg map[string]any) {
