@@ -47,6 +47,12 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("POST /api/device/tool-call", s.withServiceAuth(s.handleToolCall))
 	mux.HandleFunc("POST /api/device/system-info", s.withServiceAuth(s.handleSystemInfo))
 	mux.HandleFunc("POST /api/device/agent/run", s.withServiceAuth(s.handleAgentRun))
+	mux.HandleFunc("POST /api/device/files/list", s.withServiceAuth(s.handleFileList))
+	mux.HandleFunc("POST /api/device/files/read", s.withServiceAuth(s.handleFileRead))
+	mux.HandleFunc("POST /api/device/files/write", s.withServiceAuth(s.handleFileWrite))
+	mux.HandleFunc("POST /api/device/files/delete", s.withServiceAuth(s.handleFileDelete))
+	mux.HandleFunc("POST /api/device/files/mkdir", s.withServiceAuth(s.handleFileMkdir))
+	mux.HandleFunc("POST /api/device/files/move", s.withServiceAuth(s.handleFileMove))
 	return mux
 }
 

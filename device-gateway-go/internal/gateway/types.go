@@ -33,6 +33,8 @@ type deviceHTTPBody struct {
 	DeviceID        string          `json:"deviceId,omitempty"`
 	JWT             string          `json:"jwt,omitempty"`
 	OperationID     string          `json:"operationId,omitempty"`
+	Path            string          `json:"path,omitempty"`
+	Content         string          `json:"content,omitempty"`
 	Prompt          string          `json:"prompt,omitempty"`
 	ResumeSessionID string          `json:"resumeSessionId,omitempty"`
 	Timeout         int             `json:"timeout,omitempty"`
