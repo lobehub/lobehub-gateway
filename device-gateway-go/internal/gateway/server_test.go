@@ -218,11 +218,8 @@ func TestWebSocketJWTClaimValidation(t *testing.T) {
 	defer expired.close()
 	expired.sendJSON(t, map[string]any{"type": "auth", "token": signJWT("jwt-user", time.Now().Add(-time.Minute), time.Now().Add(-2*time.Minute)), "tokenType": "jwt"})
 	msg := expired.readJSON(t)
-	if msg["type"] != "auth_failed" || msg["reason"] != `"exp" claim timestamp check failed` {
-		t.Fatalf("expected expired jwt auth_failed, got %#v", msg)
-	}
-	if code, reason := expired.readClose(t); code != wsClosePolicy || reason != `"exp" claim timestamp check failed` {
-		t.Fatalf("unexpected expired jwt close: %d %q", code, reason)
+	if msg["type"] != "auth_expired" {
+		t.Fatalf("expected expired jwt auth_expired, got %#v", msg)
 	}
 
 	notYetActive := dialTestWS(t, httpSrv.URL, "/ws?userId=jwt-user")

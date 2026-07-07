@@ -447,6 +447,7 @@ func (o *operation) forwardToolResult(msg toolResultMessage) {
 	body, _ := json.Marshal(map[string]any{
 		"content":    msg.Content,
 		"error":      jsonRawOrNil(msg.Error),
+		"state":      jsonRawOrNil(msg.State),
 		"success":    msg.Success,
 		"toolCallId": msg.ToolCallID,
 	})

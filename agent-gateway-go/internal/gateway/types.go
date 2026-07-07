@@ -78,6 +78,7 @@ type operationRecord struct {
 type toolResultMessage struct {
 	Content    *string         `json:"content"`
 	Error      json.RawMessage `json:"error,omitempty"`
+	State      json.RawMessage `json:"state,omitempty"`
 	Success    bool            `json:"success"`
 	ToolCallID string          `json:"toolCallId"`
 	Type       string          `json:"type"`

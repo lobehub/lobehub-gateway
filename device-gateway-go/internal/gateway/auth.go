@@ -17,6 +17,8 @@ import (
 	"time"
 )
 
+var errTokenExpired = errors.New("token is expired")
+
 type authResolver struct {
 	cfg Config
 
@@ -149,7 +151,7 @@ func (a *authResolver) verifyJWT(tokenString string) (string, error) {
 	}
 	now := float64(time.Now().Unix())
 	if exp, ok := claims["exp"].(float64); ok && now >= exp {
-		return "", errors.New(`"exp" claim timestamp check failed`)
+		return "", fmt.Errorf(`"exp" claim timestamp check failed: %w`, errTokenExpired)
 	}
 	if nbf, ok := claims["nbf"].(float64); ok && now < nbf {
 		return "", errors.New(`"nbf" claim timestamp check failed`)

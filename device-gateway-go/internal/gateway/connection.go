@@ -3,6 +3,7 @@ package gateway
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"sync"
 	"time"
 )
@@ -89,11 +90,19 @@ func (c *connection) readLoop(auth *authResolver, heartbeatTimeout time.Duration
 				c.close(wsClosePolicy, err.Error())
 				return
 			}
-			verifiedUserID, err := auth.resolve(context.Background(), c.hub.userID, msg)
-			if err == nil && verifiedUserID != c.hub.userID {
+			storedUserID := c.hub.userID
+			if c.att.WorkspaceID != "" {
+				storedUserID = c.att.UserID
+			}
+			verifiedUserID, err := auth.resolve(context.Background(), storedUserID, msg)
+			if err == nil && storedUserID != "" && verifiedUserID != storedUserID {
 				err = errUserIDMismatch
 			}
 			if err != nil {
+				if errors.Is(err, errTokenExpired) {
+					_ = c.writeJSON(map[string]string{"type": "auth_expired"})
+					return
+				}
 				reason := err.Error()
 				_ = c.writeJSON(map[string]string{"reason": reason, "type": "auth_failed"})
 				c.close(wsClosePolicy, reason)
