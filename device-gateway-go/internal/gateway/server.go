@@ -369,8 +369,7 @@ func (s *Server) handleAgentRun(w http.ResponseWriter, _ *http.Request, body dev
 	case dispatchOK:
 		msg := result
 		if msg.Status == "rejected" {
-			errorText := defaultString(msg.Reason, "DEVICE_REJECTED")
-			writeJSON(w, http.StatusUnprocessableEntity, map[string]any{"error": errorText, "success": false})
+			writeJSON(w, http.StatusOK, map[string]any{"reason": msg.Reason, "status": "rejected", "success": false})
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"success": true})

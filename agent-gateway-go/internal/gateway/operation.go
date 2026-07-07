@@ -444,13 +444,18 @@ func watchdogSummary(idle time.Duration) string {
 }
 
 func (o *operation) forwardToolResult(msg toolResultMessage) {
-	body, _ := json.Marshal(map[string]any{
+	bodyMap := map[string]any{
 		"content":    msg.Content,
-		"error":      jsonRawOrNil(msg.Error),
-		"state":      jsonRawOrNil(msg.State),
 		"success":    msg.Success,
 		"toolCallId": msg.ToolCallID,
-	})
+	}
+	if len(msg.Error) > 0 {
+		bodyMap["error"] = msg.Error
+	}
+	if len(msg.State) > 0 {
+		bodyMap["state"] = msg.State
+	}
+	body, _ := json.Marshal(bodyMap)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, normalizeBaseURL(o.server.cfg.LobeAPIBaseURL)+"/api/agent/tool-result", bytes.NewReader(body))
