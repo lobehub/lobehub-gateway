@@ -2,6 +2,21 @@ package gateway
 
 import "encoding/json"
 
+const (
+	userPrincipalPrefix      = "user:"
+	workspacePrincipalPrefix = "workspace:"
+)
+
+func resolvePrincipal(userID string, workspaceID string) string {
+	if workspaceID != "" {
+		return workspacePrincipalPrefix + workspaceID
+	}
+	if userID != "" {
+		return userPrincipalPrefix + userID
+	}
+	return ""
+}
+
 type DeviceAttachment struct {
 	Authenticated bool   `json:"authenticated"`
 	Channel       string `json:"channel,omitempty"`
@@ -59,4 +74,5 @@ type deviceHTTPBody struct {
 	ToolCall        json.RawMessage `json:"toolCall,omitempty"`
 	TopicID         string          `json:"topicId,omitempty"`
 	UserID          string          `json:"userId"`
+	WorkspaceID     string          `json:"workspaceId,omitempty"`
 }

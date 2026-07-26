@@ -16,7 +16,7 @@
 ## 接口
 
 - `GET /health` 返回 `OK`
-- `GET /ws?userId=&deviceId=&connectionId=&channel=&hostname=&platform=` 升级为设备 WebSocket 连接
+- `GET /ws?userId=&workspaceId=&deviceId=&connectionId=&channel=&hostname=&platform=` 升级为设备 WebSocket 连接
 - `POST /api/device/status`
 - `POST /api/device/devices`
 - `POST /api/device/message-api`
@@ -25,7 +25,7 @@
 - `POST /api/device/rpc`
 - `POST /api/device/agent/run`
 
-所有 `/api/device/*` 接口都需要 `Authorization: Bearer <SERVICE_TOKEN>`，并且 JSON 请求体中必须包含 `userId`。
+所有 `/api/device/*` 接口都需要 `Authorization: Bearer <SERVICE_TOKEN>`，JSON 请求体中必须包含 `userId` 或 `workspaceId`；两者同时存在时由 `workspaceId` 决定路由范围。包含 `workspace_id` claim 的设备 JWT 用于认证对应 workspace 连接；不包含该 claim 的 JWT 与 API key 用于认证个人用户连接。
 
 ## 配置
 

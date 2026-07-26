@@ -60,7 +60,6 @@ func newOperation(server *Server, operationID string) *operation {
 		record: operationRecord{
 			CreatedAt:   time.Now(),
 			OperationID: operationID,
-			Status:      StatusRunning,
 		},
 		server: server,
 	}
@@ -271,7 +270,7 @@ func (o *operation) resolveInput(requestID string, content string) {
 	}
 }
 
-func (o *operation) handleResume(conn *operationConnection, lastEventID string) {
+func (o *operation) handleResume(conn *operationConnection, lastEventID string, wantStatus bool) {
 	o.mu.RLock()
 	idx := -1
 	for i, event := range o.eventBuffer {
@@ -288,9 +287,13 @@ func (o *operation) handleResume(conn *operationConnection, lastEventID string) 
 	for _, event := range missed {
 		payloads = append(payloads, append(json.RawMessage(nil), event.Data...))
 	}
+	status := o.record.Status
 	o.mu.RUnlock()
 	for _, payload := range payloads {
 		_ = conn.writeRaw(payload)
+	}
+	if wantStatus && status != "" {
+		_ = conn.writeJSON(map[string]any{"status": status, "type": "resume_complete"})
 	}
 }
 
@@ -654,11 +657,19 @@ func (c *operationConnection) handleAuth(payload []byte) {
 func (c *operationConnection) handleAuthenticatedMessage(messageType string, payload []byte) {
 	switch messageType {
 	case "resume":
+		// Field-level tolerance: a malformed or wrong-typed field must not drop the
+		// replay. The reference gateway reads `lastEventId` / `wantStatus` off an
+		// already-parsed object and only treats `wantStatus === true` as opt-in.
 		var msg struct {
-			LastEventID string `json:"lastEventId"`
+			LastEventID json.RawMessage `json:"lastEventId"`
+			WantStatus  json.RawMessage `json:"wantStatus"`
 		}
 		if json.Unmarshal(payload, &msg) == nil {
-			c.operation.handleResume(c, msg.LastEventID)
+			var lastEventID string
+			_ = json.Unmarshal(msg.LastEventID, &lastEventID)
+			var wantStatus bool
+			_ = json.Unmarshal(msg.WantStatus, &wantStatus)
+			c.operation.handleResume(c, lastEventID, wantStatus)
 		}
 	case "heartbeat":
 		c.recordHeartbeat()

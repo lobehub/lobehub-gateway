@@ -35,6 +35,8 @@
 
 所有 `/api/operations/*` 接口都要求 `Authorization: Bearer <SERVICE_TOKEN>`。`/ws` 通过首条 WebSocket 消息认证，消息可携带 LobeHub Server 签发的 JWT（用 `JWKS_PUBLIC_KEY` 校验），或携带共享的 service token。
 
+重新连接时，携带 `"wantStatus": true` 的 `resume` 消息会先收到缓冲事件；若 operation 已有权威状态，随后还会收到 `{"type":"resume_complete","status":"..."}`。省略 `wantStatus` 时保持仅重放事件的兼容行为。
+
 ## 配置
 
 | 变量 | 默认值 | 说明 |

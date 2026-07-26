@@ -127,6 +127,60 @@ func TestWebSocketPushAndResume(t *testing.T) {
 	if resumed["type"] != "agent_event" || resumed["id"] != "2" {
 		t.Fatalf("unexpected resumed event: %+v", resumed)
 	}
+	wsExpectNoMessage(t, ws2, 100*time.Millisecond)
+
+	ws2.writeJSON(t, map[string]any{"type": "resume", "lastEventId": "2", "wantStatus": true})
+	resumeComplete := ws2.readJSON(t)
+	if resumeComplete["type"] != "resume_complete" || resumeComplete["status"] != "running" {
+		t.Fatalf("unexpected resume status: %+v", resumeComplete)
+	}
+
+	// A wrong-typed `wantStatus` still replays and stays opt-out.
+	ws2.writeJSON(t, map[string]any{"type": "resume", "lastEventId": "1", "wantStatus": "true"})
+	replayed := ws2.readJSON(t)
+	if replayed["type"] != "agent_event" || replayed["id"] != "2" {
+		t.Fatalf("unexpected replayed event: %+v", replayed)
+	}
+	wsExpectNoMessage(t, ws2, 100*time.Millisecond)
+}
+
+func TestAPIKeyCurrentUserLookupSkipsCounts(t *testing.T) {
+	var query string
+	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		query = r.URL.RawQuery
+		_, _ = w.Write([]byte(`{"data":{"id":"user-1"},"success":true}`))
+	}))
+	defer api.Close()
+
+	userID, err := verifyAPIKey(t.Context(), api.URL, "api-key")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if userID != "user-1" || query != "includeCount=0" {
+		t.Fatalf("unexpected current-user lookup: user=%q query=%q", userID, query)
+	}
+}
+
+func TestResumeWithoutAuthoritativeStatusStaysSilent(t *testing.T) {
+	jwks, signJWT := testJWTSigner(t)
+	srv := NewServer(Config{JWKSPublicKey: jwks, LobeAPIBaseURL: "http://127.0.0.1:1", ServiceToken: "service-token"})
+	srv.authTimeout = time.Second
+	httpSrv := httptest.NewServer(srv.Routes())
+	defer httpSrv.Close()
+
+	ws := dialWebSocket(t, httpSrv.URL, "/ws?operationId=op-before-init")
+	defer ws.close()
+	ws.writeJSON(t, map[string]any{
+		"type":      "auth",
+		"token":     signJWT("user-1", time.Now().Add(time.Minute), time.Now().Add(-time.Minute)),
+		"tokenType": "jwt",
+	})
+	if msg := ws.readJSON(t); msg["type"] != "auth_success" {
+		t.Fatalf("expected auth_success, got %+v", msg)
+	}
+
+	ws.writeJSON(t, map[string]any{"type": "resume", "lastEventId": "", "wantStatus": true})
+	wsExpectNoMessage(t, ws, 100*time.Millisecond)
 }
 
 func TestWebSocketJWTClaimValidation(t *testing.T) {

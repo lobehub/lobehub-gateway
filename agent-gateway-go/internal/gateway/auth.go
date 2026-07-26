@@ -58,7 +58,7 @@ func verifyAPIKey(ctx context.Context, serverURL string, token string) (string, 
 		return "", err
 	}
 	parsed.Path = strings.TrimRight(parsed.Path, "/") + "/api/v1/users/me"
-	parsed.RawQuery = ""
+	parsed.RawQuery = "includeCount=0"
 	parsed.Fragment = ""
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, parsed.String(), nil)
