@@ -28,7 +28,7 @@ func newAuthResolver(cfg Config) *authResolver {
 	return &authResolver{cfg: cfg}
 }
 
-func (a *authResolver) resolve(ctx context.Context, storedUserID string, msg authMessage) (string, error) {
+func (a *authResolver) resolve(ctx context.Context, storedPrincipal string, msg authMessage) (string, error) {
 	if msg.Token == "" {
 		return "", errors.New("Missing token")
 	}
@@ -37,14 +37,18 @@ func (a *authResolver) resolve(ctx context.Context, storedUserID string, msg aut
 		if msg.ServerURL == "" {
 			return "", errors.New("Missing serverUrl")
 		}
-		return verifyAPIKey(ctx, msg.ServerURL, msg.Token)
+		userID, err := verifyAPIKey(ctx, msg.ServerURL, msg.Token)
+		if err != nil {
+			return "", err
+		}
+		return resolvePrincipal(userID, ""), nil
 	}
 
 	if msg.Token == a.cfg.ServiceToken {
-		if storedUserID == "" {
-			return "", errors.New("Missing userId")
+		if storedPrincipal == "" {
+			return "", errors.New("Missing principal")
 		}
-		return storedUserID, nil
+		return storedPrincipal, nil
 	}
 
 	return a.verifyJWT(msg.Token)
@@ -158,7 +162,8 @@ func (a *authResolver) verifyJWT(tokenString string) (string, error) {
 	if sub == "" {
 		return "", errors.New("Missing sub claim")
 	}
-	return sub, nil
+	workspaceID, _ := claims["workspace_id"].(string)
+	return resolvePrincipal(sub, workspaceID), nil
 }
 
 func (a *authResolver) publicKey() (*rsa.PublicKey, error) {

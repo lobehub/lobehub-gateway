@@ -53,18 +53,18 @@ func (s *Server) Routes() http.Handler {
 	return mux
 }
 
-func (s *Server) hub(userID string) *hub {
+func (s *Server) hub(principal string) *hub {
 	s.hubsMu.Lock()
 	defer s.hubsMu.Unlock()
-	if existing := s.hubs[userID]; existing != nil {
+	if existing := s.hubs[principal]; existing != nil {
 		return existing
 	}
-	h := newHub(userID)
-	s.hubs[userID] = h
+	h := newHub(principal)
+	s.hubs[principal] = h
 	return h
 }
 
-func (s *Server) withServiceAuth(next func(http.ResponseWriter, *http.Request, deviceHTTPBody)) http.HandlerFunc {
+func (s *Server) withServiceAuth(next func(http.ResponseWriter, *http.Request, string, deviceHTTPBody)) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if s.cfg.ServiceToken == "" || r.Header.Get("Authorization") != "Bearer "+s.cfg.ServiceToken {
 			writeText(w, http.StatusUnauthorized, "Unauthorized")
@@ -83,18 +83,19 @@ func (s *Server) withServiceAuth(next func(http.ResponseWriter, *http.Request, d
 				return
 			}
 		}
-		if body.UserID == "" {
-			writeText(w, http.StatusBadRequest, "Missing userId")
+		principal := resolvePrincipal(body.UserID, body.WorkspaceID)
+		if principal == "" {
+			writeText(w, http.StatusBadRequest, "Missing userId or workspaceId")
 			return
 		}
-		next(w, r, body)
+		next(w, r, principal, body)
 	}
 }
 
 func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
-	userID := r.URL.Query().Get("userId")
-	if userID == "" {
-		writeText(w, http.StatusBadRequest, "Missing userId")
+	principal := resolvePrincipal(r.URL.Query().Get("userId"), r.URL.Query().Get("workspaceId"))
+	if principal == "" {
+		writeText(w, http.StatusBadRequest, "Missing userId or workspaceId")
 		return
 	}
 
@@ -104,7 +105,7 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	}
 
 	now := time.Now().UnixMilli()
-	h := s.hub(userID)
+	h := s.hub(principal)
 	conn := &connection{
 		att: DeviceAttachment{
 			Authenticated: false,
@@ -125,39 +126,39 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	go conn.readLoop(s.auth, s.heartbeatTimeout)
 }
 
-func (s *Server) handleDeviceAPI(w http.ResponseWriter, r *http.Request, body deviceHTTPBody) {
+func (s *Server) handleDeviceAPI(w http.ResponseWriter, r *http.Request, principal string, body deviceHTTPBody) {
 	switch r.URL.Path {
 	case "/api/device/status":
-		s.handleStatus(w, r, body)
+		s.handleStatus(w, r, principal, body)
 	case "/api/device/devices":
-		s.handleDevices(w, r, body)
+		s.handleDevices(w, r, principal, body)
 	case "/api/device/message-api":
 		if r.Method == http.MethodPost {
-			s.handleMessageAPI(w, r, body)
+			s.handleMessageAPI(w, r, principal, body)
 			return
 		}
 		writeText(w, http.StatusNotFound, "404 page not found")
 	case "/api/device/tool-call":
 		if r.Method == http.MethodPost {
-			s.handleToolCall(w, r, body)
+			s.handleToolCall(w, r, principal, body)
 			return
 		}
 		writeText(w, http.StatusNotFound, "404 page not found")
 	case "/api/device/system-info":
 		if r.Method == http.MethodPost {
-			s.handleSystemInfo(w, r, body)
+			s.handleSystemInfo(w, r, principal, body)
 			return
 		}
 		writeText(w, http.StatusNotFound, "404 page not found")
 	case "/api/device/rpc":
 		if r.Method == http.MethodPost {
-			s.handleRPC(w, r, body)
+			s.handleRPC(w, r, principal, body)
 			return
 		}
 		writeText(w, http.StatusNotFound, "404 page not found")
 	case "/api/device/agent/run":
 		if r.Method == http.MethodPost {
-			s.handleAgentRun(w, r, body)
+			s.handleAgentRun(w, r, principal, body)
 			return
 		}
 		writeText(w, http.StatusNotFound, "404 page not found")
@@ -166,17 +167,18 @@ func (s *Server) handleDeviceAPI(w http.ResponseWriter, r *http.Request, body de
 	}
 }
 
-func (s *Server) handleStatus(w http.ResponseWriter, _ *http.Request, body deviceHTTPBody) {
-	connections := s.hub(body.UserID).authenticatedConnections()
-	writeJSON(w, http.StatusOK, map[string]any{"deviceCount": s.hub(body.UserID).deviceCount(), "online": len(connections) > 0})
+func (s *Server) handleStatus(w http.ResponseWriter, _ *http.Request, principal string, _ deviceHTTPBody) {
+	h := s.hub(principal)
+	connections := h.authenticatedConnections()
+	writeJSON(w, http.StatusOK, map[string]any{"deviceCount": h.deviceCount(), "online": len(connections) > 0})
 }
 
-func (s *Server) handleDevices(w http.ResponseWriter, _ *http.Request, body deviceHTTPBody) {
-	writeJSON(w, http.StatusOK, map[string]any{"devices": s.hub(body.UserID).devices()})
+func (s *Server) handleDevices(w http.ResponseWriter, _ *http.Request, principal string, _ deviceHTTPBody) {
+	writeJSON(w, http.StatusOK, map[string]any{"devices": s.hub(principal).devices()})
 }
 
-func (s *Server) handleToolCall(w http.ResponseWriter, _ *http.Request, body deviceHTTPBody) {
-	h := s.hub(body.UserID)
+func (s *Server) handleToolCall(w http.ResponseWriter, _ *http.Request, principal string, body deviceHTTPBody) {
+	h := s.hub(principal)
 	if len(h.authenticatedConnections()) == 0 {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"content": "桌面设备不在线", "error": "DEVICE_OFFLINE", "success": false})
 		return
@@ -210,8 +212,8 @@ func (s *Server) handleToolCall(w http.ResponseWriter, _ *http.Request, body dev
 	}
 }
 
-func (s *Server) handleSystemInfo(w http.ResponseWriter, _ *http.Request, body deviceHTTPBody) {
-	h := s.hub(body.UserID)
+func (s *Server) handleSystemInfo(w http.ResponseWriter, _ *http.Request, principal string, body deviceHTTPBody) {
+	h := s.hub(principal)
 	if len(h.authenticatedConnections()) == 0 {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "DEVICE_OFFLINE", "success": false})
 		return
@@ -235,12 +237,12 @@ func (s *Server) handleSystemInfo(w http.ResponseWriter, _ *http.Request, body d
 	}
 }
 
-func (s *Server) handleRPC(w http.ResponseWriter, _ *http.Request, body deviceHTTPBody) {
+func (s *Server) handleRPC(w http.ResponseWriter, _ *http.Request, principal string, body deviceHTTPBody) {
 	if strings.TrimSpace(body.Method) == "" {
 		writeText(w, http.StatusBadRequest, "Missing method")
 		return
 	}
-	h := s.hub(body.UserID)
+	h := s.hub(principal)
 	if len(h.authenticatedConnections()) == 0 {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "DEVICE_OFFLINE", "success": false})
 		return
@@ -274,8 +276,8 @@ func (s *Server) handleRPC(w http.ResponseWriter, _ *http.Request, body deviceHT
 	}
 }
 
-func (s *Server) handleMessageAPI(w http.ResponseWriter, _ *http.Request, body deviceHTTPBody) {
-	h := s.hub(body.UserID)
+func (s *Server) handleMessageAPI(w http.ResponseWriter, _ *http.Request, principal string, body deviceHTTPBody) {
+	h := s.hub(principal)
 	if len(h.authenticatedConnections()) == 0 {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"content": "桌面设备不在线", "error": "DEVICE_OFFLINE", "success": false})
 		return
@@ -307,12 +309,12 @@ func (s *Server) handleMessageAPI(w http.ResponseWriter, _ *http.Request, body d
 	}
 }
 
-func (s *Server) handleAgentRun(w http.ResponseWriter, _ *http.Request, body deviceHTTPBody) {
+func (s *Server) handleAgentRun(w http.ResponseWriter, _ *http.Request, principal string, body deviceHTTPBody) {
 	if strings.TrimSpace(body.OperationID) == "" {
 		writeText(w, http.StatusBadRequest, "Missing operationId")
 		return
 	}
-	h := s.hub(body.UserID)
+	h := s.hub(principal)
 	if len(h.authenticatedConnections()) == 0 {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "DEVICE_OFFLINE", "success": false})
 		return

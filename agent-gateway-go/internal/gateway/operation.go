@@ -49,7 +49,14 @@ type operation struct {
 	pendingConf  map[string]pendingConfirmation
 	pendingInput map[string]pendingInput
 	record       operationRecord
-	watchdog     *time.Timer
+	// sendMu orders "snapshot state -> write to sockets" sequences against each
+	// other. o.mu only protects the in-memory record; it is released before the
+	// actual socket writes so a slow client cannot stall the operation. Without
+	// sendMu a resume could snapshot `running`, lose the race to a concurrent
+	// status update that already broadcast `completed`, and then regress the
+	// client with a stale `resume_complete`.
+	sendMu   sync.Mutex
+	watchdog *time.Timer
 }
 
 func newOperation(server *Server, operationID string) *operation {
@@ -60,7 +67,6 @@ func newOperation(server *Server, operationID string) *operation {
 		record: operationRecord{
 			CreatedAt:   time.Now(),
 			OperationID: operationID,
-			Status:      StatusRunning,
 		},
 		server: server,
 	}
@@ -121,6 +127,7 @@ func (o *operation) nextEventIDLocked() string {
 
 func (o *operation) pushEvent(event agentStreamEvent) {
 	msg := map[string]any{"event": event, "type": "agent_event"}
+	o.sendMu.Lock()
 	o.mu.Lock()
 	id := o.nextEventIDLocked()
 	msg["id"] = id
@@ -131,6 +138,7 @@ func (o *operation) pushEvent(event agentStreamEvent) {
 	connections := o.authenticatedConnectionsLocked()
 	o.mu.Unlock()
 	broadcast(connections, msg)
+	o.sendMu.Unlock()
 
 	if event.Type == "agent_runtime_end" {
 		o.handleAgentRuntimeEnd(event)
@@ -139,6 +147,8 @@ func (o *operation) pushEvent(event agentStreamEvent) {
 
 func (o *operation) broadcastToolExecute(event agentStreamEvent) {
 	msg := map[string]any{"event": event, "type": "agent_event"}
+	o.sendMu.Lock()
+	defer o.sendMu.Unlock()
 	o.mu.Lock()
 	id := o.nextEventIDLocked()
 	msg["id"] = id
@@ -162,6 +172,8 @@ func (o *operation) handleAgentRuntimeEnd(event agentStreamEvent) {
 
 func (o *operation) handleSessionEnd(status SessionStatus, summary string) {
 	msg := map[string]any{"summary": summary, "type": "session_complete"}
+	o.sendMu.Lock()
+	defer o.sendMu.Unlock()
 	o.mu.Lock()
 	o.record.Status = status
 	id := o.nextEventIDLocked()
@@ -174,6 +186,8 @@ func (o *operation) handleSessionEnd(status SessionStatus, summary string) {
 }
 
 func (o *operation) updateStatus(status SessionStatus, summary string) {
+	o.sendMu.Lock()
+	defer o.sendMu.Unlock()
 	o.mu.Lock()
 	o.record.Status = status
 	id := o.nextEventIDLocked()
@@ -196,6 +210,7 @@ func (o *operation) requestConfirmation(toolCallID string, tool toolCallInfo, ti
 	msg := map[string]any{"tool": tool, "toolCallId": toolCallID, "type": "tool_confirmation_request"}
 	ch := make(chan bool, 1)
 	timer := time.NewTimer(timeout)
+	o.sendMu.Lock()
 	o.mu.Lock()
 	id := o.nextEventIDLocked()
 	msg["id"] = id
@@ -204,6 +219,7 @@ func (o *operation) requestConfirmation(toolCallID string, tool toolCallInfo, ti
 	connections := o.authenticatedConnectionsLocked()
 	o.mu.Unlock()
 	broadcast(connections, msg)
+	o.sendMu.Unlock()
 
 	select {
 	case approved := <-ch:
@@ -221,6 +237,7 @@ func (o *operation) requestInput(prompt string, timeout time.Duration) (string, 
 	msg := map[string]any{"prompt": prompt, "requestId": requestID, "type": "input_request"}
 	ch := make(chan string, 1)
 	timer := time.NewTimer(timeout)
+	o.sendMu.Lock()
 	o.mu.Lock()
 	id := o.nextEventIDLocked()
 	msg["id"] = id
@@ -229,6 +246,7 @@ func (o *operation) requestInput(prompt string, timeout time.Duration) (string, 
 	connections := o.authenticatedConnectionsLocked()
 	o.mu.Unlock()
 	broadcast(connections, msg)
+	o.sendMu.Unlock()
 
 	select {
 	case content := <-ch:
@@ -271,7 +289,9 @@ func (o *operation) resolveInput(requestID string, content string) {
 	}
 }
 
-func (o *operation) handleResume(conn *operationConnection, lastEventID string) {
+func (o *operation) handleResume(conn *operationConnection, lastEventID string, wantStatus bool) {
+	o.sendMu.Lock()
+	defer o.sendMu.Unlock()
 	o.mu.RLock()
 	idx := -1
 	for i, event := range o.eventBuffer {
@@ -288,9 +308,13 @@ func (o *operation) handleResume(conn *operationConnection, lastEventID string) 
 	for _, event := range missed {
 		payloads = append(payloads, append(json.RawMessage(nil), event.Data...))
 	}
+	status := o.record.Status
 	o.mu.RUnlock()
 	for _, payload := range payloads {
 		_ = conn.writeRaw(payload)
+	}
+	if wantStatus && status != "" {
+		_ = conn.writeJSON(map[string]any{"status": status, "type": "resume_complete"})
 	}
 }
 
@@ -352,6 +376,8 @@ func (o *operation) fireWatchdog() {
 	o.mu.Unlock()
 
 	result, ok := o.callFinalizeAbandoned(operationID, "inactivity_watchdog")
+	o.sendMu.Lock()
+	defer o.sendMu.Unlock()
 	abandoned := true
 	if ok {
 		if result.Abandoned != nil {
@@ -654,11 +680,19 @@ func (c *operationConnection) handleAuth(payload []byte) {
 func (c *operationConnection) handleAuthenticatedMessage(messageType string, payload []byte) {
 	switch messageType {
 	case "resume":
+		// Field-level tolerance: a malformed or wrong-typed field must not drop the
+		// replay. The reference gateway reads `lastEventId` / `wantStatus` off an
+		// already-parsed object and only treats `wantStatus === true` as opt-in.
 		var msg struct {
-			LastEventID string `json:"lastEventId"`
+			LastEventID json.RawMessage `json:"lastEventId"`
+			WantStatus  json.RawMessage `json:"wantStatus"`
 		}
 		if json.Unmarshal(payload, &msg) == nil {
-			c.operation.handleResume(c, msg.LastEventID)
+			var lastEventID string
+			_ = json.Unmarshal(msg.LastEventID, &lastEventID)
+			var wantStatus bool
+			_ = json.Unmarshal(msg.WantStatus, &wantStatus)
+			c.operation.handleResume(c, lastEventID, wantStatus)
 		}
 	case "heartbeat":
 		c.recordHeartbeat()

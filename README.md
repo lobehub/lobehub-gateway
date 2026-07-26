@@ -18,8 +18,8 @@ The original gateway implementations remain the protocol reference. This reposit
 
 The protocol baseline for this repository is the pair of standalone reference implementations:
 
-- `device-gateway` at `d9df5542f06df6f5555356efa0735f767f0e5ccf`
-- `agent-gateway` at `82dc31148e270866356a24c3b4fbefa912479ebb`
+- `device-gateway` at `5025dedda2fcbf5de1dc42d4bf112cdd45ff3d24`
+- `agent-gateway` at `96a31e038052a8a98e9986223a170d218c253d0f`
 
 For implemented gateway services, the target is compatibility with the public HTTP routes, WebSocket messages, request and response shapes, authentication behavior, routing semantics, and timeout behavior exposed by those reference implementations. This target intentionally keeps the Go runtime self-hosted and single-instance oriented.
 

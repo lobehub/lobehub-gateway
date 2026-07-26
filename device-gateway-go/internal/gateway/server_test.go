@@ -49,7 +49,7 @@ func TestHTTPAuthAndOfflineResponses(t *testing.T) {
 
 	res = postJSON(t, httpSrv.URL+"/api/device/status", "service-token", `{}`)
 	assertStatus(t, res, http.StatusBadRequest)
-	assertBody(t, res, "Missing userId")
+	assertBody(t, res, "Missing userId or workspaceId")
 
 	res = postJSON(t, httpSrv.URL+"/api/device/status", "service-token", `{"userId":"u1"}`)
 	assertStatus(t, res, http.StatusOK)
@@ -211,12 +211,12 @@ func TestWebSocketJWTClaimValidation(t *testing.T) {
 
 	fresh := dialTestWS(t, httpSrv.URL, "/ws?userId=jwt-user")
 	defer fresh.close()
-	fresh.sendJSON(t, map[string]any{"type": "auth", "token": signJWT("jwt-user", time.Now().Add(time.Minute), time.Now().Add(-time.Minute)), "tokenType": "jwt"})
+	fresh.sendJSON(t, map[string]any{"type": "auth", "token": signJWT("jwt-user", "", time.Now().Add(time.Minute), time.Now().Add(-time.Minute)), "tokenType": "jwt"})
 	assertWSJSON(t, fresh, map[string]any{"type": "auth_success"})
 
 	expired := dialTestWS(t, httpSrv.URL, "/ws?userId=jwt-user")
 	defer expired.close()
-	expired.sendJSON(t, map[string]any{"type": "auth", "token": signJWT("jwt-user", time.Now().Add(-time.Minute), time.Now().Add(-2*time.Minute)), "tokenType": "jwt"})
+	expired.sendJSON(t, map[string]any{"type": "auth", "token": signJWT("jwt-user", "", time.Now().Add(-time.Minute), time.Now().Add(-2*time.Minute)), "tokenType": "jwt"})
 	msg := expired.readJSON(t)
 	if msg["type"] != "auth_failed" || msg["reason"] != `"exp" claim timestamp check failed` {
 		t.Fatalf("expected expired jwt auth_failed, got %#v", msg)
@@ -227,13 +227,50 @@ func TestWebSocketJWTClaimValidation(t *testing.T) {
 
 	notYetActive := dialTestWS(t, httpSrv.URL, "/ws?userId=jwt-user")
 	defer notYetActive.close()
-	notYetActive.sendJSON(t, map[string]any{"type": "auth", "token": signJWT("jwt-user", time.Now().Add(time.Minute), time.Now().Add(time.Minute)), "tokenType": "jwt"})
+	notYetActive.sendJSON(t, map[string]any{"type": "auth", "token": signJWT("jwt-user", "", time.Now().Add(time.Minute), time.Now().Add(time.Minute)), "tokenType": "jwt"})
 	msg = notYetActive.readJSON(t)
 	if msg["type"] != "auth_failed" || msg["reason"] != `"nbf" claim timestamp check failed` {
 		t.Fatalf("expected nbf auth_failed, got %#v", msg)
 	}
 	if code, reason := notYetActive.readClose(t); code != wsClosePolicy || reason != `"nbf" claim timestamp check failed` {
 		t.Fatalf("unexpected nbf jwt close: %d %q", code, reason)
+	}
+}
+
+func TestWorkspacePrincipalRoutingAndJWTAuth(t *testing.T) {
+	jwks, signJWT := testJWTSigner(t)
+	srv := NewServer(Config{JWKSPublicKey: jwks, ServiceToken: "service-token"})
+	srv.authTimeout = time.Second
+	httpSrv := httptest.NewServer(srv.Routes())
+	defer httpSrv.Close()
+
+	ws := dialTestWS(t, httpSrv.URL, "/ws?userId=signer&workspaceId=workspace-1&deviceId=shared")
+	defer ws.close()
+	ws.sendJSON(t, map[string]any{
+		"type":      "auth",
+		"token":     signJWT("signer", "workspace-1", time.Now().Add(time.Minute), time.Now().Add(-time.Minute)),
+		"tokenType": "jwt",
+	})
+	assertWSJSON(t, ws, map[string]any{"type": "auth_success"})
+
+	res := postJSON(t, httpSrv.URL+"/api/device/status", "service-token", `{"userId":"signer","workspaceId":"workspace-1"}`)
+	assertStatus(t, res, http.StatusOK)
+	assertJSON(t, res, map[string]any{"deviceCount": float64(1), "online": true})
+
+	res = postJSON(t, httpSrv.URL+"/api/device/status", "service-token", `{"userId":"signer"}`)
+	assertStatus(t, res, http.StatusOK)
+	assertJSON(t, res, map[string]any{"deviceCount": float64(0), "online": false})
+
+	mismatch := dialTestWS(t, httpSrv.URL, "/ws?workspaceId=workspace-2")
+	defer mismatch.close()
+	mismatch.sendJSON(t, map[string]any{
+		"type":      "auth",
+		"token":     signJWT("signer", "workspace-1", time.Now().Add(time.Minute), time.Now().Add(-time.Minute)),
+		"tokenType": "jwt",
+	})
+	msg := mismatch.readJSON(t)
+	if msg["type"] != "auth_failed" || msg["reason"] != "principal mismatch" {
+		t.Fatalf("expected workspace principal mismatch, got %#v", msg)
 	}
 }
 
@@ -499,7 +536,7 @@ func base64Std(value []byte) string {
 	return out.String()
 }
 
-func testJWTSigner(t *testing.T) (string, func(string, time.Time, time.Time) string) {
+func testJWTSigner(t *testing.T) (string, func(string, string, time.Time, time.Time) string) {
 	t.Helper()
 	key, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
@@ -519,18 +556,22 @@ func testJWTSigner(t *testing.T) (string, func(string, time.Time, time.Time) str
 		t.Fatal(err)
 	}
 
-	return string(jwks), func(sub string, exp time.Time, nbf time.Time) string {
+	return string(jwks), func(sub string, workspaceID string, exp time.Time, nbf time.Time) string {
 		t.Helper()
 		header, err := json.Marshal(map[string]any{"alg": "RS256", "typ": "JWT"})
 		if err != nil {
 			t.Fatal(err)
 		}
-		payload, err := json.Marshal(map[string]any{
+		claims := map[string]any{
 			"exp": exp.Unix(),
 			"iat": time.Now().Unix(),
 			"nbf": nbf.Unix(),
 			"sub": sub,
-		})
+		}
+		if workspaceID != "" {
+			claims["workspace_id"] = workspaceID
+		}
+		payload, err := json.Marshal(claims)
 		if err != nil {
 			t.Fatal(err)
 		}
