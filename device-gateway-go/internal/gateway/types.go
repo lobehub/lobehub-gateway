@@ -45,9 +45,11 @@ type rpcEnvelope struct {
 
 type deviceHTTPBody struct {
 	AgentType       string          `json:"agentType,omitempty"`
+	Args            []string        `json:"args,omitempty"`
 	API             json.RawMessage `json:"api,omitempty"`
 	CWD             string          `json:"cwd,omitempty"`
 	DeviceID        string          `json:"deviceId,omitempty"`
+	ImageList       json.RawMessage `json:"imageList,omitempty"`
 	JWT             string          `json:"jwt,omitempty"`
 	Method          string          `json:"method,omitempty"`
 	OperationID     string          `json:"operationId,omitempty"`

@@ -333,8 +333,14 @@ func (s *Server) handleAgentRun(w http.ResponseWriter, _ *http.Request, body dev
 		"topicId":     body.TopicID,
 		"type":        "agent_run_request",
 	}
+	if len(body.Args) > 0 {
+		msg["args"] = body.Args
+	}
 	if body.CWD != "" {
 		msg["cwd"] = body.CWD
+	}
+	if len(body.ImageList) > 0 {
+		msg["imageList"] = json.RawMessage(body.ImageList)
 	}
 	if body.ResumeSessionID != "" {
 		msg["resumeSessionId"] = body.ResumeSessionID

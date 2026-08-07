@@ -16,6 +16,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -310,7 +311,7 @@ func TestAgentRunForwardsSystemContext(t *testing.T) {
 
 	done := make(chan map[string]any, 1)
 	go func() {
-		res := postJSON(t, httpSrv.URL+"/api/device/agent/run", "service-token", `{"userId":"u1","deviceId":"d1","operationId":"op-1","agentType":"claude-code","jwt":"jwt-1","prompt":"run","topicId":"topic-1","cwd":"/repo","resumeSessionId":"sess-1","systemContext":"repo rules","timeout":1000}`)
+		res := postJSON(t, httpSrv.URL+"/api/device/agent/run", "service-token", `{"userId":"u1","deviceId":"d1","operationId":"op-1","agentType":"codex","args":["--model","gpt-5.6-luna"],"imageList":[{"id":"img-1","url":"https://example.com/image.png"}],"jwt":"jwt-1","prompt":"run","topicId":"topic-1","cwd":"/repo","resumeSessionId":"sess-1","systemContext":"repo rules","timeout":1000}`)
 		assertStatus(t, res, http.StatusOK)
 		var body map[string]any
 		decodeJSON(t, res, &body)
@@ -320,6 +321,9 @@ func TestAgentRunForwardsSystemContext(t *testing.T) {
 	request := ws.readJSON(t)
 	if request["type"] != "agent_run_request" ||
 		request["operationId"] != "op-1" ||
+		request["agentType"] != "codex" ||
+		!reflect.DeepEqual(request["args"], []any{"--model", "gpt-5.6-luna"}) ||
+		!reflect.DeepEqual(request["imageList"], []any{map[string]any{"id": "img-1", "url": "https://example.com/image.png"}}) ||
 		request["systemContext"] != "repo rules" ||
 		request["cwd"] != "/repo" ||
 		request["resumeSessionId"] != "sess-1" {
