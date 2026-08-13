@@ -127,6 +127,36 @@ func TestWebSocketPushAndResume(t *testing.T) {
 	if resumed["type"] != "agent_event" || resumed["id"] != "2" {
 		t.Fatalf("unexpected resumed event: %+v", resumed)
 	}
+	wsExpectNoMessage(t, ws2, 100*time.Millisecond)
+
+	ws2.writeJSON(t, map[string]any{"type": "resume", "lastEventId": "1", "wantStatus": true})
+	resumed = ws2.readJSON(t)
+	if resumed["type"] != "agent_event" || resumed["id"] != "2" {
+		t.Fatalf("unexpected resumed event with status requested: %+v", resumed)
+	}
+	resumeComplete := ws2.readJSON(t)
+	if resumeComplete["type"] != "resume_complete" || resumeComplete["status"] != "running" {
+		t.Fatalf("unexpected resume_complete: %+v", resumeComplete)
+	}
+}
+
+func TestWebSocketResumeCompleteWithoutBufferedEvents(t *testing.T) {
+	_, ts := testServer()
+	defer ts.Close()
+	postJSON(t, ts.URL+"/api/operations/init", map[string]any{"operationId": "op-resume-empty", "userId": "user-1"}, http.StatusOK)
+
+	ws := dialWebSocket(t, ts.URL, "/ws?operationId=op-resume-empty")
+	defer ws.close()
+	ws.writeJSON(t, map[string]any{"type": "auth", "token": "service-token"})
+	if msg := ws.readJSON(t); msg["type"] != "auth_success" {
+		t.Fatalf("expected auth_success, got %+v", msg)
+	}
+
+	ws.writeJSON(t, map[string]any{"type": "resume", "lastEventId": "", "wantStatus": true})
+	resumeComplete := ws.readJSON(t)
+	if resumeComplete["type"] != "resume_complete" || resumeComplete["status"] != "running" {
+		t.Fatalf("unexpected resume_complete: %+v", resumeComplete)
+	}
 }
 
 func TestWebSocketJWTClaimValidation(t *testing.T) {
