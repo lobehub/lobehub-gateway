@@ -60,7 +60,13 @@ func newOperation(server *Server, operationID string) *operation {
 		record: operationRecord{
 			CreatedAt:   time.Now(),
 			OperationID: operationID,
-			Status:      StatusRunning,
+			// Status intentionally left empty to mirror upstream DO storage,
+			// which starts undefined and is only set when /api/operations/init
+			// lands. This makes the init/resume race (LOBE-10443) observable:
+			// a WS resume that arrives before init sees no stored status and
+			// gets no resume_complete, so the opt-in client keeps waiting
+			// instead of false-completing.
+			Status: "",
 		},
 		server: server,
 	}
@@ -288,15 +294,20 @@ func (o *operation) handleResume(conn *operationConnection, lastEventID string, 
 	for _, event := range missed {
 		payloads = append(payloads, append(json.RawMessage(nil), event.Data...))
 	}
+	// Mirror upstream AgentOperationDO.handleResume: only confirm a status we
+	// actually hold. A missing status can mean "init hasn't landed yet" (the
+	// init/resume race) just as much as "already cleaned up" — synthesizing a
+	// terminal signal here would abort a run that is only just starting, and
+	// emitting an out-of-enum value breaks the SessionStatus contract. The
+	// opt-in client treats "no resume_complete" as "keep waiting" — live events
+	// still stream and heartbeat loss still forces reconnect — which is safe
+	// and recoverable. See LOBE-10443.
 	status := o.record.Status
-	if status == "" {
-		status = "unknown"
-	}
 	o.mu.RUnlock()
 	for _, payload := range payloads {
 		_ = conn.writeRaw(payload)
 	}
-	if wantStatus {
+	if wantStatus && status != "" {
 		_ = conn.writeJSON(map[string]any{
 			"status": status,
 			"type":   "resume_complete",
