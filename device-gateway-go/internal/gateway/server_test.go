@@ -16,6 +16,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -297,7 +298,7 @@ func TestMessageAPIAndGenericRPC(t *testing.T) {
 	}
 }
 
-func TestAgentRunForwardsSystemContext(t *testing.T) {
+func TestAgentRunForwardsAllOptionalFields(t *testing.T) {
 	srv := NewServer(Config{ServiceToken: "service-token"})
 	srv.authTimeout = time.Second
 	httpSrv := httptest.NewServer(srv.Routes())
@@ -310,7 +311,8 @@ func TestAgentRunForwardsSystemContext(t *testing.T) {
 
 	done := make(chan map[string]any, 1)
 	go func() {
-		res := postJSON(t, httpSrv.URL+"/api/device/agent/run", "service-token", `{"userId":"u1","deviceId":"d1","operationId":"op-1","agentType":"claude-code","jwt":"jwt-1","prompt":"run","topicId":"topic-1","cwd":"/repo","resumeSessionId":"sess-1","systemContext":"repo rules","timeout":1000}`)
+		res := postJSON(t, httpSrv.URL+"/api/device/agent/run", "service-token",
+			`{"userId":"u1","deviceId":"d1","operationId":"op-1","agentType":"codex","args":["--model","gpt-5.6-luna"],"imageList":[{"id":"img-1","url":"https://example.com/image.png"}],"assistantMessageId":"asst-1","ingestWorkspaceId":"ws-1","resumeFallbackSystemContext":"fallback ctx","workspaceId":"ws-1","jwt":"jwt-1","prompt":"run","topicId":"topic-1","cwd":"/repo","resumeSessionId":"sess-1","systemContext":"repo rules","timeout":1000}`)
 		assertStatus(t, res, http.StatusOK)
 		var body map[string]any
 		decodeJSON(t, res, &body)
@@ -318,17 +320,94 @@ func TestAgentRunForwardsSystemContext(t *testing.T) {
 	}()
 
 	request := ws.readJSON(t)
-	if request["type"] != "agent_run_request" ||
-		request["operationId"] != "op-1" ||
-		request["systemContext"] != "repo rules" ||
-		request["cwd"] != "/repo" ||
-		request["resumeSessionId"] != "sess-1" {
-		t.Fatalf("unexpected agent run request: %#v", request)
+	if request["type"] != "agent_run_request" {
+		t.Fatalf("unexpected type: %#v", request["type"])
+	}
+	if request["operationId"] != "op-1" {
+		t.Fatalf("unexpected operationId: %#v", request["operationId"])
+	}
+	// deviceId and timeout must be stripped (upstream `...runParams` excludes them).
+	if _, ok := request["deviceId"]; ok {
+		t.Fatalf("deviceId should not be forwarded: %#v", request["deviceId"])
+	}
+	if _, ok := request["timeout"]; ok {
+		t.Fatalf("timeout should not be forwarded: %#v", request["timeout"])
+	}
+	// Every optional field declared in AgentRunRequestMessage must arrive verbatim.
+	if request["agentType"] != "codex" {
+		t.Fatalf("unexpected agentType: %#v", request["agentType"])
+	}
+	if !reflect.DeepEqual(request["args"], []any{"--model", "gpt-5.6-luna"}) {
+		t.Fatalf("unexpected args: %#v", request["args"])
+	}
+	if !reflect.DeepEqual(request["imageList"], []any{map[string]any{"id": "img-1", "url": "https://example.com/image.png"}}) {
+		t.Fatalf("unexpected imageList: %#v", request["imageList"])
+	}
+	if request["assistantMessageId"] != "asst-1" {
+		t.Fatalf("unexpected assistantMessageId: %#v", request["assistantMessageId"])
+	}
+	if request["ingestWorkspaceId"] != "ws-1" {
+		t.Fatalf("unexpected ingestWorkspaceId: %#v", request["ingestWorkspaceId"])
+	}
+	if request["resumeFallbackSystemContext"] != "fallback ctx" {
+		t.Fatalf("unexpected resumeFallbackSystemContext: %#v", request["resumeFallbackSystemContext"])
+	}
+	if request["workspaceId"] != "ws-1" {
+		t.Fatalf("unexpected workspaceId: %#v", request["workspaceId"])
+	}
+	if request["systemContext"] != "repo rules" {
+		t.Fatalf("unexpected systemContext: %#v", request["systemContext"])
+	}
+	if request["cwd"] != "/repo" {
+		t.Fatalf("unexpected cwd: %#v", request["cwd"])
+	}
+	if request["resumeSessionId"] != "sess-1" {
+		t.Fatalf("unexpected resumeSessionId: %#v", request["resumeSessionId"])
 	}
 	ws.sendJSON(t, map[string]any{"operationId": "op-1", "status": "accepted", "type": "agent_run_ack"})
 	if body := <-done; body["success"] != true {
 		t.Fatalf("unexpected agent run response: %#v", body)
 	}
+}
+
+// TestAgentRunPreservesEmptyValues verifies the spread semantics forward empty
+// arrays/objects verbatim instead of dropping them — the key behavioral
+// difference from a per-field `if len > 0` guard. Device-side branches that
+// distinguish "field absent" from "field empty" must see the same shape the
+// upstream TypeScript spread produces.
+func TestAgentRunPreservesEmptyValues(t *testing.T) {
+	srv := NewServer(Config{ServiceToken: "service-token"})
+	srv.authTimeout = time.Second
+	httpSrv := httptest.NewServer(srv.Routes())
+	defer httpSrv.Close()
+
+	ws := dialTestWS(t, httpSrv.URL, "/ws?userId=u1&deviceId=d1&connectionId=conn-1")
+	defer ws.close()
+	ws.sendJSON(t, map[string]any{"type": "auth", "token": "service-token"})
+	assertWSJSON(t, ws, map[string]any{"type": "auth_success"})
+
+	done := make(chan struct{}, 1)
+	go func() {
+		res := postJSON(t, httpSrv.URL+"/api/device/agent/run", "service-token",
+			`{"userId":"u1","deviceId":"d1","operationId":"op-2","agentType":"codex","args":[],"imageList":[],"jwt":"jwt-1","prompt":"run","topicId":"topic-1","timeout":1000}`)
+		assertStatus(t, res, http.StatusOK)
+		done <- struct{}{}
+	}()
+
+	request := ws.readJSON(t)
+	if request["type"] != "agent_run_request" {
+		t.Fatalf("unexpected type: %#v", request["type"])
+	}
+	args, ok := request["args"].([]any)
+	if !ok || len(args) != 0 {
+		t.Fatalf("args should be an empty array, got %#v", request["args"])
+	}
+	imageList, ok := request["imageList"].([]any)
+	if !ok || len(imageList) != 0 {
+		t.Fatalf("imageList should be an empty array, got %#v", request["imageList"])
+	}
+	ws.sendJSON(t, map[string]any{"operationId": "op-2", "status": "accepted", "type": "agent_run_ack"})
+	<-done
 }
 
 func TestConnectionIDChannelCoexistenceAndPriority(t *testing.T) {

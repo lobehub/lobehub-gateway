@@ -59,4 +59,10 @@ type deviceHTTPBody struct {
 	ToolCall        json.RawMessage `json:"toolCall,omitempty"`
 	TopicID         string          `json:"topicId,omitempty"`
 	UserID          string          `json:"userId"`
+
+	// rawPayload preserves the original HTTP request body so handlers that need
+	// verbatim forwarding (e.g. agent run) can mirror the upstream TypeScript
+	// `...runParams` spread without enumerating every optional field. Populated
+	// by withServiceAuth; not serialized.
+	rawPayload json.RawMessage `json:"-"`
 }

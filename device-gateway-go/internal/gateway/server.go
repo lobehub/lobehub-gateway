@@ -82,6 +82,7 @@ func (s *Server) withServiceAuth(next func(http.ResponseWriter, *http.Request, d
 				writeText(w, http.StatusBadRequest, err.Error())
 				return
 			}
+			body.rawPayload = payload
 		}
 		if body.UserID == "" {
 			writeText(w, http.StatusBadRequest, "Missing userId")
@@ -325,30 +326,25 @@ func (s *Server) handleAgentRun(w http.ResponseWriter, _ *http.Request, body dev
 	timeout := timeoutOrDefault(body.Timeout, defaultAgentRunTimeout)
 	key := body.OperationID
 
-	msg := map[string]any{
-		"agentType":   body.AgentType,
-		"jwt":         body.JWT,
-		"operationId": body.OperationID,
-		"prompt":      body.Prompt,
-		"topicId":     body.TopicID,
-		"type":        "agent_run_request",
-	}
-	if body.CWD != "" {
-		msg["cwd"] = body.CWD
-	}
-	if body.ResumeSessionID != "" {
-		msg["resumeSessionId"] = body.ResumeSessionID
-	}
-	if body.SystemContext != "" {
-		msg["systemContext"] = body.SystemContext
+	// Forward the request body verbatim minus deviceId/timeout, mirroring the
+	// upstream TypeScript `const { deviceId, timeout, ...runParams } = body;
+	// ws.send({ type: 'agent_run_request', ...runParams })` spread. Every
+	// optional field (args, imageList, assistantMessageId, ingestWorkspaceId,
+	// resumeFallbackSystemContext, workspaceId, ...) and future additions
+	// reaches the device without per-field plumbing. Empty values are
+	// preserved so device-side `if (msg.args)` vs `if (msg.args?.length)`
+	// branches match the upstream behavior.
+	msg, err := agentRunRequestPayload(body.rawPayload)
+	if err != nil {
+		writeText(w, http.StatusBadRequest, err.Error())
+		return
 	}
 
 	result, status := h.dispatch(target, key, timeout, msg)
 	switch status {
 	case dispatchOK:
-		msg := result
-		if msg.Status == "rejected" {
-			errorText := defaultString(msg.Reason, "DEVICE_REJECTED")
+		if result.Status == "rejected" {
+			errorText := defaultString(result.Reason, "DEVICE_REJECTED")
 			writeJSON(w, http.StatusUnprocessableEntity, map[string]any{"error": errorText, "success": false})
 			return
 		}
@@ -358,6 +354,26 @@ func (s *Server) handleAgentRun(w http.ResponseWriter, _ *http.Request, body dev
 	case dispatchOffline:
 		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "DEVICE_OFFLINE", "success": false})
 	}
+}
+
+// agentRunRequestPayload builds the `agent_run_request` WebSocket payload by
+// forwarding every field of the HTTP request body except `deviceId` and
+// `timeout`, then injecting `type: "agent_run_request"`. Field values are kept
+// as raw JSON so empty arrays/objects and nulls survive verbatim, matching the
+// upstream spread semantics.
+func agentRunRequestPayload(raw json.RawMessage) (map[string]any, error) {
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		return nil, err
+	}
+	delete(fields, "deviceId")
+	delete(fields, "timeout")
+
+	msg := map[string]any{"type": "agent_run_request"}
+	for k, v := range fields {
+		msg[k] = v
+	}
+	return msg, nil
 }
 
 func writeJSON(w http.ResponseWriter, status int, value any) {
