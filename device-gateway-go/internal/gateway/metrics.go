@@ -20,20 +20,20 @@ const (
 	metricCleanupInterval = time.Minute
 )
 
-// Disk readings are optional: devices that predate them omit both fields, and
-// they read back without them.
+// Disk readings stay raw so absent fields marshal as omitted while explicit
+// null reads back as null.
 type metricSample struct {
-	Connected        bool     `json:"connected"`
-	CPUCount         float64  `json:"cpuCount"`
-	CPUPercent       *float64 `json:"cpuPercent"`
-	DiskTotalBytes   *float64 `json:"diskTotalBytes,omitempty"`
-	DiskUsedBytes    *float64 `json:"diskUsedBytes,omitempty"`
-	Load1            *float64 `json:"load1"`
-	Load15           *float64 `json:"load15"`
-	Load5            *float64 `json:"load5"`
-	MemoryTotalBytes float64  `json:"memoryTotalBytes"`
-	MemoryUsedBytes  float64  `json:"memoryUsedBytes"`
-	ObservedAt       float64  `json:"observedAt"`
+	Connected        bool            `json:"connected"`
+	CPUCount         float64         `json:"cpuCount"`
+	CPUPercent       *float64        `json:"cpuPercent"`
+	DiskTotalBytes   json.RawMessage `json:"diskTotalBytes,omitempty"`
+	DiskUsedBytes    json.RawMessage `json:"diskUsedBytes,omitempty"`
+	Load1            *float64        `json:"load1"`
+	Load15           *float64        `json:"load15"`
+	Load5            *float64        `json:"load5"`
+	MemoryTotalBytes float64         `json:"memoryTotalBytes"`
+	MemoryUsedBytes  float64         `json:"memoryUsedBytes"`
+	ObservedAt       float64         `json:"observedAt"`
 }
 
 type metricKey struct{ userID, deviceID string }
@@ -77,7 +77,16 @@ func decodeMetricSample(raw json.RawMessage) (metricSample, bool) {
 			return metricSample{}, false
 		}
 	}
-	for _, value := range []*float64{sample.CPUPercent, sample.DiskTotalBytes, sample.DiskUsedBytes, sample.Load1, sample.Load5, sample.Load15} {
+	for _, raw := range []json.RawMessage{sample.DiskTotalBytes, sample.DiskUsedBytes} {
+		if len(raw) == 0 {
+			continue
+		}
+		var value *float64
+		if json.Unmarshal(raw, &value) != nil || value != nil && !metricNumber(*value) {
+			return metricSample{}, false
+		}
+	}
+	for _, value := range []*float64{sample.CPUPercent, sample.Load1, sample.Load5, sample.Load15} {
 		if value != nil && !metricNumber(*value) {
 			return metricSample{}, false
 		}

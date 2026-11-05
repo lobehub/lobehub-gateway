@@ -44,8 +44,16 @@ func TestMetricSampleValidation(t *testing.T) {
 		{name: "negative load", field: "load1", value: -1},
 		{name: "invalid CPU", field: "cpuPercent", value: 101},
 		{name: "negative timestamp", field: "observedAt", value: -1},
-		{name: "negative disk", field: "diskUsedBytes", value: -1},
-		{name: "wrong disk", field: "diskTotalBytes", value: "1000"},
+		{name: "negative disk total", field: "diskTotalBytes", value: -1},
+		{name: "negative disk used", field: "diskUsedBytes", value: -1},
+		{name: "string disk total", field: "diskTotalBytes", value: "1000"},
+		{name: "string disk used", field: "diskUsedBytes", value: "1000"},
+		{name: "bool disk total", field: "diskTotalBytes", value: true},
+		{name: "bool disk used", field: "diskUsedBytes", value: true},
+		{name: "object disk total", field: "diskTotalBytes", value: map[string]any{}},
+		{name: "object disk used", field: "diskUsedBytes", value: map[string]any{}},
+		{name: "array disk total", field: "diskTotalBytes", value: []any{}},
+		{name: "array disk used", field: "diskUsedBytes", value: []any{}},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -64,6 +72,13 @@ func TestMetricSampleValidation(t *testing.T) {
 			}
 		})
 	}
+	base := string(metricJSON(1000))
+	for _, field := range []string{"diskTotalBytes", "diskUsedBytes"} {
+		raw := json.RawMessage(fmt.Sprintf(`%s,"%s":1e400}`, base[:len(base)-1], field))
+		if _, ok := decodeMetricSample(raw); ok {
+			t.Fatalf("accepted overflowing %s", field)
+		}
+	}
 	for _, raw := range []json.RawMessage{metricJSON(1000), json.RawMessage(`{"connected":false,"cpuCount":0,"cpuPercent":null,"load1":null,"load5":null,"load15":null,"memoryTotalBytes":0,"memoryUsedBytes":0,"observedAt":0}`)} {
 		if _, ok := decodeMetricSample(raw); !ok {
 			t.Fatalf("rejected valid sample: %s", raw)
@@ -72,25 +87,130 @@ func TestMetricSampleValidation(t *testing.T) {
 }
 
 func TestMetricDiskReadings(t *testing.T) {
-	s := testMetricStore(t)
 	now := time.Now().Truncate(time.Millisecond)
-	at := func(delta time.Duration) float64 { return float64(now.Add(delta).UnixMilli()) }
+	var base map[string]any
+	if err := json.Unmarshal(metricJSON(float64(now.UnixMilli())), &base); err != nil {
+		t.Fatal(err)
+	}
+	tests := []struct {
+		name      string
+		patch     func(map[string]any)
+		wantTotal any
+		wantUsed  any
+		hasTotal  bool
+		hasUsed   bool
+	}{
+		{name: "both positive", patch: func(m map[string]any) {
+			m["diskTotalBytes"] = 1000
+			m["diskUsedBytes"] = 400
+		}, wantTotal: float64(1000), wantUsed: float64(400), hasTotal: true, hasUsed: true},
+		{name: "both null", patch: func(m map[string]any) {
+			m["diskTotalBytes"] = nil
+			m["diskUsedBytes"] = nil
+		}, hasTotal: true, hasUsed: true},
+		{name: "both missing", patch: func(m map[string]any) {}},
+		{name: "both zero", patch: func(m map[string]any) {
+			m["diskTotalBytes"] = 0
+			m["diskUsedBytes"] = 0
+		}, wantTotal: float64(0), wantUsed: float64(0), hasTotal: true, hasUsed: true},
+		{name: "only total", patch: func(m map[string]any) {
+			m["diskTotalBytes"] = 1000
+		}, wantTotal: float64(1000), hasTotal: true},
+		{name: "only used", patch: func(m map[string]any) {
+			m["diskUsedBytes"] = 400
+		}, wantUsed: float64(400), hasUsed: true},
+		{name: "null and number mixed", patch: func(m map[string]any) {
+			m["diskTotalBytes"] = nil
+			m["diskUsedBytes"] = 400
+		}, wantUsed: float64(400), hasTotal: true, hasUsed: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			s := testMetricStore(t)
+			key := metricKey{"u1", "d1"}
+			fields := make(map[string]any, len(base)+2)
+			for key, value := range base {
+				fields[key] = value
+			}
+			test.patch(fields)
+			raw, err := json.Marshal(fields)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if accepted := s.store(key, []json.RawMessage{raw}, now); accepted != 1 {
+				t.Fatalf("accepted=%d want 1", accepted)
+			}
+			encoded, err := json.Marshal(s.read(key, 0, now))
+			if err != nil {
+				t.Fatal(err)
+			}
+			var results []map[string]any
+			if err := json.Unmarshal(encoded, &results); err != nil {
+				t.Fatal(err)
+			}
+			if len(results) != 1 {
+				t.Fatalf("results=%d want 1", len(results))
+			}
+			gotTotal, hasTotal := results[0]["diskTotalBytes"]
+			gotUsed, hasUsed := results[0]["diskUsedBytes"]
+			if hasTotal != test.hasTotal || hasUsed != test.hasUsed {
+				t.Fatalf("disk key presence mismatch: %s", encoded)
+			}
+			if hasTotal && gotTotal != test.wantTotal {
+				t.Fatalf("diskTotalBytes=%v want %v", gotTotal, test.wantTotal)
+			}
+			if hasUsed && gotUsed != test.wantUsed {
+				t.Fatalf("diskUsedBytes=%v want %v", gotUsed, test.wantUsed)
+			}
+		})
+	}
+	// A later sample at the same timestamp replaces the stored one wholesale.
+	s := testMetricStore(t)
 	key := metricKey{"u1", "d1"}
-	withDisk := json.RawMessage(fmt.Sprintf(`{"connected":true,"cpuCount":8,"cpuPercent":25,"diskTotalBytes":1000,"diskUsedBytes":400,"load1":null,"load5":null,"load15":null,"memoryTotalBytes":16000,"memoryUsedBytes":8000,"observedAt":%v}`, at(-2*time.Minute)))
-	unreadDisk := json.RawMessage(fmt.Sprintf(`{"connected":true,"cpuCount":8,"cpuPercent":25,"diskTotalBytes":null,"diskUsedBytes":null,"load1":null,"load5":null,"load15":null,"memoryTotalBytes":16000,"memoryUsedBytes":8000,"observedAt":%v}`, at(-time.Minute)))
-	if accepted := s.store(key, []json.RawMessage{withDisk, unreadDisk, metricJSON(at(0))}, now); accepted != 3 {
-		t.Fatalf("accepted=%d want 3", accepted)
+	replacements := []struct {
+		patch    func(map[string]any)
+		wantKeys map[string]any // key present but mapped to nil means explicit null
+	}{
+		{patch: func(m map[string]any) {
+			m["diskTotalBytes"] = 5
+			m["diskUsedBytes"] = 5
+		}, wantKeys: map[string]any{"diskTotalBytes": float64(5), "diskUsedBytes": float64(5)}},
+		{patch: func(m map[string]any) {
+			m["diskTotalBytes"] = nil
+			m["diskUsedBytes"] = nil
+		}, wantKeys: map[string]any{"diskTotalBytes": nil, "diskUsedBytes": nil}},
+		{patch: func(m map[string]any) {}, wantKeys: map[string]any{}},
 	}
-	encoded, _ := json.Marshal(s.read(key, 0, now))
-	var results []map[string]any
-	_ = json.Unmarshal(encoded, &results)
-	if results[0]["diskTotalBytes"] != float64(1000) || results[0]["diskUsedBytes"] != float64(400) {
-		t.Fatalf("disk readings not kept: %v", results[0])
-	}
-	// Devices without disk readings must read back without the fields, as they sent them.
-	for _, result := range results[1:] {
-		if _, ok := result["diskTotalBytes"]; ok {
-			t.Fatalf("absent disk reading serialized: %v", result)
+	for i, state := range replacements {
+		fields := make(map[string]any, len(base)+2)
+		for key, value := range base {
+			fields[key] = value
+		}
+		state.patch(fields)
+		raw, err := json.Marshal(fields)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if accepted := s.store(key, []json.RawMessage{raw}, now); accepted != 1 {
+			t.Fatalf("replacement %d: accepted=%d want 1", i, accepted)
+		}
+		encoded, err := json.Marshal(s.read(key, 0, now))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var results []map[string]any
+		if err := json.Unmarshal(encoded, &results); err != nil {
+			t.Fatal(err)
+		}
+		if len(results) != 1 {
+			t.Fatalf("replacement %d: results=%d want 1", i, len(results))
+		}
+		for _, field := range []string{"diskTotalBytes", "diskUsedBytes"} {
+			got, has := results[0][field]
+			want, ok := state.wantKeys[field]
+			if has != ok || has && got != want {
+				t.Fatalf("replacement %d: %s=%v present=%v, want %v present=%v: %s", i, field, got, has, want, ok, encoded)
+			}
 		}
 	}
 }
@@ -283,5 +403,66 @@ func TestDeviceMetricsWebSocketAndHTTP(t *testing.T) {
 	fresh := NewServer(Config{ServiceToken: "service-token"})
 	if got := fresh.metrics.read(metricKey{"u1", "d1"}, 0, time.Now()); len(got) != 0 {
 		t.Fatal("new process retained metric history")
+	}
+}
+
+func TestDeviceMetricsDiskWebSocketAndHTTP(t *testing.T) {
+	s := NewServer(Config{ServiceToken: "service-token"})
+	ts := httptest.NewServer(s.Routes())
+	defer ts.Close()
+	t.Cleanup(func() {
+		s.metrics.mu.Lock()
+		defer s.metrics.mu.Unlock()
+		if s.metrics.timer != nil {
+			s.metrics.timer.Stop()
+		}
+	})
+	device := dialTestWS(t, ts.URL, "/ws?userId=u1&deviceId=d1")
+	defer device.close()
+	device.sendJSON(t, map[string]any{"type": "auth", "token": "service-token"})
+	assertWSJSON(t, device, map[string]any{"type": "auth_success"})
+	at := float64(time.Now().UnixMilli())
+	sample := func(observedAt float64, patch func(map[string]any)) json.RawMessage {
+		var fields map[string]any
+		if err := json.Unmarshal(metricJSON(observedAt), &fields); err != nil {
+			t.Fatal(err)
+		}
+		patch(fields)
+		raw, err := json.Marshal(fields)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return raw
+	}
+	numbered := sample(at, func(m map[string]any) {
+		m["diskTotalBytes"] = 1000
+		m["diskUsedBytes"] = 400
+	})
+	nulled := sample(at+1, func(m map[string]any) {
+		m["diskTotalBytes"] = nil
+		m["diskUsedBytes"] = nil
+	})
+	missing := sample(at+2, func(m map[string]any) {})
+	device.sendJSON(t, map[string]any{"type": "device_metrics", "batchId": "disk", "samples": []json.RawMessage{numbered, nulled, missing}})
+	assertWSJSON(t, device, map[string]any{"type": "device_metrics_ack", "batchId": "disk", "accepted": float64(3)})
+	res := postJSON(t, ts.URL+"/api/device/metrics", "service-token", `{"userId":"u1","deviceId":"d1"}`)
+	assertStatus(t, res, 200)
+	var body struct {
+		Samples []map[string]any `json:"samples"`
+	}
+	decodeJSON(t, res, &body)
+	if len(body.Samples) != 3 {
+		t.Fatalf("samples=%d want 3", len(body.Samples))
+	}
+	if body.Samples[0]["diskTotalBytes"] != float64(1000) || body.Samples[0]["diskUsedBytes"] != float64(400) {
+		t.Fatalf("numeric disk readings not returned: %v", body.Samples[0])
+	}
+	for _, field := range []string{"diskTotalBytes", "diskUsedBytes"} {
+		if value, ok := body.Samples[1][field]; !ok || value != nil {
+			t.Fatalf("null %s not kept: %v", field, body.Samples[1])
+		}
+		if _, ok := body.Samples[2][field]; ok {
+			t.Fatalf("missing %s serialized: %v", field, body.Samples[2])
+		}
 	}
 }
