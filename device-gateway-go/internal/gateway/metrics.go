@@ -20,16 +20,20 @@ const (
 	metricCleanupInterval = time.Minute
 )
 
+// Disk readings stay raw so absent fields marshal as omitted while explicit
+// null reads back as null.
 type metricSample struct {
-	Connected        bool     `json:"connected"`
-	CPUCount         float64  `json:"cpuCount"`
-	CPUPercent       *float64 `json:"cpuPercent"`
-	Load1            *float64 `json:"load1"`
-	Load15           *float64 `json:"load15"`
-	Load5            *float64 `json:"load5"`
-	MemoryTotalBytes float64  `json:"memoryTotalBytes"`
-	MemoryUsedBytes  float64  `json:"memoryUsedBytes"`
-	ObservedAt       float64  `json:"observedAt"`
+	Connected        bool            `json:"connected"`
+	CPUCount         float64         `json:"cpuCount"`
+	CPUPercent       *float64        `json:"cpuPercent"`
+	DiskTotalBytes   json.RawMessage `json:"diskTotalBytes,omitempty"`
+	DiskUsedBytes    json.RawMessage `json:"diskUsedBytes,omitempty"`
+	Load1            *float64        `json:"load1"`
+	Load15           *float64        `json:"load15"`
+	Load5            *float64        `json:"load5"`
+	MemoryTotalBytes float64         `json:"memoryTotalBytes"`
+	MemoryUsedBytes  float64         `json:"memoryUsedBytes"`
+	ObservedAt       float64         `json:"observedAt"`
 }
 
 type metricKey struct{ userID, deviceID string }
@@ -70,6 +74,15 @@ func decodeMetricSample(raw json.RawMessage) (metricSample, bool) {
 	}
 	for _, value := range []float64{sample.CPUCount, sample.MemoryTotalBytes, sample.MemoryUsedBytes, sample.ObservedAt} {
 		if !metricNumber(value) {
+			return metricSample{}, false
+		}
+	}
+	for _, raw := range []json.RawMessage{sample.DiskTotalBytes, sample.DiskUsedBytes} {
+		if len(raw) == 0 {
+			continue
+		}
+		var value *float64
+		if json.Unmarshal(raw, &value) != nil || value != nil && !metricNumber(*value) {
 			return metricSample{}, false
 		}
 	}

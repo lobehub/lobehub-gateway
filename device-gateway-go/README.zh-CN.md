@@ -34,7 +34,7 @@
 
 ## 设备健康指标
 
-已认证的设备发送 `device_metrics` 消息，包含 `batchId` 和 `samples` 数组；网关回复 `{ type: "device_metrics_ack", batchId, accepted }`。样本字段为 `connected`、`cpuCount`、`cpuPercent`、`load1`、`load5`、`load15`、`memoryTotalBytes`、`memoryUsedBytes` 和 `observedAt`（毫秒时间戳），CPU 使用率和负载允许为 `null`。样本归属由已认证 socket 的用户和设备 ID 决定，消息中额外提供的 ID 不会改变归属。
+已认证的设备发送 `device_metrics` 消息，包含 `batchId` 和 `samples` 数组；网关回复 `{ type: "device_metrics_ack", batchId, accepted }`。样本字段为 `connected`、`cpuCount`、`cpuPercent`、`load1`、`load5`、`load15`、`memoryTotalBytes`、`memoryUsedBytes` 和 `observedAt`（毫秒时间戳），CPU 使用率和负载允许为 `null`。样本还可带上 `diskTotalBytes` 和 `diskUsedBytes`（用户主目录所在磁盘），两者均可选：缺失的字段在读取时省略，显式 `null` 原样返回。样本归属由已认证 socket 的用户和设备 ID 决定，消息中额外提供的 ID 不会改变归属。
 
 `POST /api/device/metrics` 使用 Service Token 认证，接受 `{ userId, deviceId, since? }`，返回按采样时间升序排列的 `{ samples: [...] }`。`deviceId` 必填，数字 `since` 为包含边界的查询起点，缺省或非数字时按零处理。结果限制为最近 48 小时，设备离线后仍可查询；没有历史时返回 `{ samples: [] }`。
 
