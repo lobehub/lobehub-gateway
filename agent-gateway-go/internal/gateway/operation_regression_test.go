@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+	"testing/synctest"
 	"time"
 )
 
@@ -178,6 +179,74 @@ func TestLateTerminalReplayReportsGapBeforeCompletion(t *testing.T) {
 		}
 	}
 	t.Fatal("terminal replay did not complete")
+}
+
+func TestPassiveTerminalReplaySurvivesCleanupDeadline(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ws, srv := terminalReplaySocket(t, terminalResumeGrace/2, time.Second)
+		defer ws.close()
+		ws.writeJSON(t, map[string]any{"type": "auth", "token": "service-token"})
+		if msg := ws.readJSON(t); msg["type"] != "auth_success" {
+			t.Fatalf("expected auth_success, got %+v", msg)
+		}
+		time.Sleep(terminalResumeGrace / 2)
+		synctest.Wait()
+		if srv.getOperation("terminal-replay") != nil {
+			t.Fatal("operation remains available after its cleanup deadline")
+		}
+		if msg := ws.readJSON(t); msg["type"] != "session_complete" {
+			t.Fatalf("expected terminal replay after cleanup, got %+v", msg)
+		}
+		if opcode, err := ws.br.ReadByte(); err != nil || opcode&0x0f != wsCloseMessage {
+			t.Fatalf("expected the expired connection to close after replay, got opcode %d, err %v", opcode&0x0f, err)
+		}
+	})
+}
+
+func TestSlowTerminalResumeDoesNotExpireHeartbeat(t *testing.T) {
+	const heartbeatTimeout = 50 * time.Millisecond
+	ws, _ := terminalReplaySocket(t, 5*time.Second, heartbeatTimeout)
+	defer ws.close()
+	ws.writeJSON(t, map[string]any{"type": "auth", "token": "service-token"})
+	if msg := ws.readJSON(t); msg["type"] != "auth_success" {
+		t.Fatalf("expected auth_success, got %+v", msg)
+	}
+	ws.writeJSON(t, map[string]any{"type": "resume", "lastEventId": "0", "wantStatus": true})
+	// net.Pipe holds the replay write until the client reads the first frame.
+	time.Sleep(2 * heartbeatTimeout)
+	if msg := ws.readJSON(t); msg["type"] != "session_complete" {
+		t.Fatalf("expected terminal replay, got %+v", msg)
+	}
+	if msg := ws.readJSON(t); msg["type"] != "resume_complete" {
+		t.Fatalf("expected replay status, got %+v", msg)
+	}
+	ws.writeJSON(t, map[string]any{"type": "heartbeat"})
+	if msg := ws.readJSON(t); msg["type"] != "heartbeat_ack" {
+		t.Fatalf("expected heartbeat after replay, got %+v", msg)
+	}
+}
+
+func terminalReplaySocket(t *testing.T, cleanupDelay, heartbeatTimeout time.Duration) (*testWS, *Server) {
+	t.Helper()
+	srv := NewServer(Config{ServiceToken: "service-token"})
+	srv.cleanupDelay = cleanupDelay
+	srv.heartbeatTimeout = heartbeatTimeout
+	const operationID = "terminal-replay"
+	op := srv.getOrCreateOperation(operationID)
+	op.init(operationID, "user", nil)
+	op.updateStatus(StatusCompleted, "")
+
+	server, client := net.Pipe()
+	_ = client.SetWriteDeadline(time.Now().Add(2 * time.Second))
+	t.Cleanup(func() {
+		_ = client.Close()
+		_ = server.Close()
+		op.cleanup()
+	})
+	conn := newOperationConnection(op, &wsConn{br: bufio.NewReader(server), conn: server})
+	op.register(conn)
+	go conn.readLoop()
+	return &testWS{br: bufio.NewReader(client), conn: client}, srv
 }
 
 type failingWriteConn struct{ net.Conn }
