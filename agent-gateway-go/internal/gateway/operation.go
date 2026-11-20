@@ -20,6 +20,8 @@ const (
 	eventBufferTrim      = 500
 	eventBufferMaxBytes  = 16 << 20
 	eventBufferTrimBytes = eventBufferMaxBytes / 2
+
+	terminalResumeGrace = 750 * time.Millisecond
 )
 
 type queuedHubEvent struct {
@@ -46,6 +48,7 @@ type operation struct {
 	eventBuffer      []bufferedEvent
 	eventBufferBytes int
 	eventCounter     int
+	expired          bool
 	hubDispatch      bool
 	hubOverflow      bool
 	hubQueue         []queuedHubEvent
@@ -325,58 +328,70 @@ func (o *operation) handleResume(conn *operationConnection, lastEventID string, 
 	// opt-in client treats "no resume_complete" as "keep waiting" — live events
 	// still stream and heartbeat loss still forces reconnect — which is safe
 	// and recoverable. See LOBE-10443.
+	terminal := isTerminalStatus(status)
 	for _, payload := range payloads {
-		if !isMuxOnlyPayload(payload) && o.llmRecipient(conn, payload) && !conn.writeOrClose(payload) {
+		if skipV1ReplayPayload(payload, terminal) || !o.llmRecipient(conn, payload) {
+			continue
+		}
+		if !conn.writeOrClose(payload) {
 			return
 		}
 	}
 	if wantStatus && status != "" {
-		conn.writeOrClose(mustMarshal(map[string]any{
-			"gap":    gap,
-			"status": status,
-			"type":   "resume_complete",
-		}))
+		conn.writeResumeComplete(gap, status)
 	}
 }
 
 // A v1 client that connects after completion may never send a resume request.
-func (o *operation) replayFinished(conn *operationConnection, userID string) {
+func (o *operation) replayFinished(conn *operationConnection, userID string) bool {
 	o.mu.Lock()
-	if o.record.UserID != userID || !isTerminalStatus(o.record.Status) {
+	if _, attached := o.connections[conn]; !attached || o.record.UserID != userID || !isTerminalStatus(o.record.Status) {
 		o.mu.Unlock()
-		return
+		return false
 	}
 	payloads, gap, status := o.collectReplayLocked(0)
+	operationID := o.record.OperationID
 	o.mu.Unlock()
+
+	gapReported := false
 	for _, payload := range payloads {
 		var message struct {
 			Type  string `json:"type"`
 			Event struct {
-				Type string `json:"type"`
+				Type        string `json:"type"`
+				OperationID string `json:"operationId"`
 			} `json:"event"`
 		}
 		if json.Unmarshal(payload, &message) != nil {
 			continue
 		}
-		// Replay stream history and the terminal signal, skipping dispatch
-		// requests that no longer have a waiting operation.
 		switch message.Type {
-		case "session_complete":
-			conn.writeOrClose(payload)
-			return
 		case "agent_event":
-			switch message.Event.Type {
-			case "message_patch", "tool_execute":
+			if skipV1ReplayEvent(message.Event.Type, true) {
 				continue
 			}
-			if !conn.writeOrClose(payload) {
-				return
+		case "session_complete":
+		default:
+			continue
+		}
+
+		terminal := message.Type == "session_complete" ||
+			(message.Event.Type == "agent_runtime_end" &&
+				(message.Event.OperationID == "" || message.Event.OperationID == operationID))
+		if terminal && gap && !gapReported {
+			if !conn.writeResumeComplete(true, status) {
+				return false
 			}
+			gapReported = true
+		}
+		if !conn.writeOrClose(payload) {
+			return false
+		}
+		if message.Type == "session_complete" {
+			return true
 		}
 	}
-	conn.writeOrClose(mustMarshal(map[string]any{
-		"gap": gap, "status": status, "type": "resume_complete",
-	}))
+	return gapReported || conn.writeResumeComplete(gap, status)
 }
 
 func (o *operation) collectReplay(lastEventID string) ([]json.RawMessage, bool, SessionStatus) {
@@ -404,11 +419,14 @@ func (o *operation) collectReplayLocked(since int) ([]json.RawMessage, bool, Ses
 		}
 	}
 	sort.SliceStable(payloads, func(i, j int) bool { return messageID(payloads[i]) < messageID(payloads[j]) })
-	gap := o.eventCounter > since
-	if len(o.eventBuffer) > 0 {
-		gap = parseEventID(o.eventBuffer[0].ID) > since+1
+	return payloads, o.replayGapLocked(since), o.record.Status
+}
+
+func (o *operation) replayGapLocked(since int) bool {
+	if len(o.eventBuffer) == 0 {
+		return o.eventCounter > since
 	}
-	return payloads, gap, o.record.Status
+	return since < parseEventID(o.eventBuffer[0].ID)-1
 }
 
 func (o *operation) hubSnapshot() (string, SessionStatus, *operationMeta) {
@@ -659,20 +677,45 @@ func (o *operation) scheduleCleanupLocked() {
 
 func (o *operation) cleanup() {
 	o.mu.Lock()
-	connections := make([]*operationConnection, 0, len(o.connections))
-	for conn := range o.connections {
-		connections = append(connections, conn)
+	if o.expired {
+		o.mu.Unlock()
+		return
 	}
-	o.connections = map[*operationConnection]struct{}{}
+	o.expired = true
+	var connections []*operationConnection
+	for conn := range o.connections {
+		if conn.terminalReplayPending {
+			continue
+		}
+		connections = append(connections, conn)
+		delete(o.connections, conn)
+	}
 	o.stopWatchdogLocked()
 	o.stopCleanupLocked()
 	operationID := o.record.OperationID
 	o.mu.Unlock()
+
+	// Retire the operation without waiting for terminal recovery to finish.
 	o.server.notifyLifecycle(o, "gone", "")
+	o.server.removeOperation(operationID, o)
 	for _, conn := range connections {
 		conn.close(wsCloseNormal, "Session expired")
 	}
-	o.server.removeOperation(operationID, o)
+}
+
+func (o *operation) finishTerminalReplay(c *operationConnection) {
+	o.mu.Lock()
+	c.terminalReplayPending = false
+	_, attached := o.connections[c]
+	expired := o.expired
+	if attached && !expired {
+		c.startHeartbeatTimer(o.server.heartbeatTimeout)
+	}
+	o.mu.Unlock()
+
+	if attached && expired {
+		c.close(wsCloseNormal, "Session expired")
+	}
 }
 
 func (o *operation) stopCleanupLocked() {
@@ -696,6 +739,13 @@ type operationConnection struct {
 	mu             sync.RWMutex
 	operation      *operation
 	ws             *wsConn
+
+	terminalReplayPending bool // guarded by operation.mu
+
+	// Owned by the read loop. The timer sends its result before a late
+	// resume can decide whether any history still needs to be replayed.
+	terminalReplayTimer *time.Timer
+	terminalReplayDone  chan bool
 }
 
 func newOperationConnection(op *operation, ws *wsConn) *operationConnection {
@@ -736,14 +786,18 @@ func (c *operationConnection) markAuthenticated(userID string, isAdmin bool, pen
 }
 
 func (o *operation) authenticateConnection(c *operationConnection, userID string, clientID ...string) (bool, error) {
-	o.mu.RLock()
-	defer o.mu.RUnlock()
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if _, attached := o.connections[c]; !attached || o.expired {
+		return false, errors.New("Session expired")
+	}
 	storedUserID := o.record.UserID
 	if storedUserID != "" && storedUserID != userID {
 		return false, errors.New("userId mismatch")
 	}
 	c.markAuthenticated(userID, false, storedUserID == "", clientID...)
-	return storedUserID != "" && isTerminalStatus(o.record.Status), nil
+	c.terminalReplayPending = storedUserID != "" && isTerminalStatus(o.record.Status)
+	return c.terminalReplayPending, nil
 }
 
 func (c *operationConnection) recordHeartbeat() {
@@ -758,6 +812,12 @@ func (c *operationConnection) writeJSON(v any) error {
 		return err
 	}
 	return c.writeRaw(payload)
+}
+
+func (c *operationConnection) writeResumeComplete(gap bool, status SessionStatus) bool {
+	return c.writeOrClose(mustMarshal(map[string]any{
+		"gap": gap, "status": status, "type": "resume_complete",
+	}))
 }
 
 func (c *operationConnection) writeRaw(payload []byte) error {
@@ -778,6 +838,8 @@ func (c *operationConnection) close(code int, reason string) {
 }
 
 func (c *operationConnection) startAuthTimer(timeout time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	c.authTimer = time.AfterFunc(timeout, func() {
 		if c.isAuthenticated() {
 			return
@@ -789,6 +851,8 @@ func (c *operationConnection) startAuthTimer(timeout time.Duration) {
 }
 
 func (c *operationConnection) startHeartbeatTimer(timeout time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	c.heartbeatTimer = time.AfterFunc(timeout, func() {
 		c.close(wsCloseNormal, "Heartbeat timeout")
 		c.operation.remove(c)
@@ -796,12 +860,16 @@ func (c *operationConnection) startHeartbeatTimer(timeout time.Duration) {
 }
 
 func (c *operationConnection) resetHeartbeatTimer(timeout time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	if c.heartbeatTimer != nil {
 		c.heartbeatTimer.Reset(timeout)
 	}
 }
 
 func (c *operationConnection) stopTimers() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	if c.authTimer != nil {
 		c.authTimer.Stop()
 	}
@@ -812,6 +880,11 @@ func (c *operationConnection) stopTimers() {
 
 func (c *operationConnection) readLoop() {
 	defer c.operation.remove(c)
+	defer func() {
+		if c.terminalReplayTimer != nil {
+			c.terminalReplayTimer.Stop()
+		}
+	}()
 
 	for {
 		payload, err := c.ws.readMessage()
@@ -861,16 +934,21 @@ func (c *operationConnection) handleAuth(payload []byte) {
 		c.close(wsClosePolicy, reason)
 		return
 	}
-	if c.authTimer != nil {
-		c.authTimer.Stop()
-	}
+	c.stopTimers()
 	if !c.writeOrClose(mustMarshal(map[string]string{"type": "auth_success"})) {
 		return
 	}
-	if finished {
-		c.operation.replayFinished(c, verifiedUserID)
+	if !finished {
+		c.startHeartbeatTimer(c.operation.server.heartbeatTimeout)
+		return
 	}
-	c.startHeartbeatTimer(c.operation.server.heartbeatTimeout)
+	done := make(chan bool, 1)
+	c.terminalReplayDone = done
+	c.terminalReplayTimer = time.AfterFunc(terminalResumeGrace, func() {
+		replayed := c.operation.replayFinished(c, verifiedUserID)
+		c.operation.finishTerminalReplay(c)
+		done <- replayed
+	})
 }
 
 func (c *operationConnection) verifyPendingOwner(userID string) {
@@ -896,9 +974,27 @@ func (c *operationConnection) handleAuthenticatedMessage(messageType string, pay
 			LastEventID string `json:"lastEventId"`
 			WantStatus  bool   `json:"wantStatus"`
 		}
-		if json.Unmarshal(payload, &msg) == nil {
-			c.operation.handleResume(c, msg.LastEventID, msg.WantStatus)
+		if json.Unmarshal(payload, &msg) != nil {
+			return
 		}
+		if timer := c.terminalReplayTimer; timer != nil {
+			c.terminalReplayTimer = nil
+			if timer.Stop() {
+				defer c.operation.finishTerminalReplay(c)
+			} else if <-c.terminalReplayDone {
+				if msg.WantStatus {
+					c.operation.mu.RLock()
+					gap := c.operation.replayGapLocked(parseEventID(msg.LastEventID))
+					status := c.operation.record.Status
+					c.operation.mu.RUnlock()
+					if status != "" {
+						c.writeResumeComplete(gap, status)
+					}
+				}
+				return
+			}
+		}
+		c.operation.handleResume(c, msg.LastEventID, msg.WantStatus)
 	case "heartbeat":
 		c.recordHeartbeat()
 		c.resetHeartbeatTimer(c.operation.server.heartbeatTimeout)
@@ -958,14 +1054,19 @@ func mustMarshal(value any) []byte {
 	return payload
 }
 
-func isMuxOnlyPayload(payload json.RawMessage) bool {
+func skipV1ReplayPayload(payload json.RawMessage, terminal bool) bool {
 	var message struct {
 		Event *struct {
 			Type string `json:"type"`
 		} `json:"event"`
 		Type string `json:"type"`
 	}
-	return json.Unmarshal(payload, &message) == nil && message.Type == "agent_event" && message.Event != nil && message.Event.Type == "message_patch"
+	return json.Unmarshal(payload, &message) == nil && message.Type == "agent_event" &&
+		message.Event != nil && skipV1ReplayEvent(message.Event.Type, terminal)
+}
+
+func skipV1ReplayEvent(eventType string, terminal bool) bool {
+	return eventType == "message_patch" || (terminal && eventType == "tool_execute")
 }
 
 func parseEventID(value string) int {

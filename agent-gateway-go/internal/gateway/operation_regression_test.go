@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+	"testing/synctest"
 	"time"
 )
 
@@ -48,8 +49,10 @@ func TestLateWebSocketReplaysCompletedOperation(t *testing.T) {
 		want   string
 	}{{"completed", "session_complete"}, {"error", "resume_complete"}} {
 		t.Run(final.status, func(t *testing.T) {
-			_, ts := testServer()
+			srv, ts := testServer()
 			defer ts.Close()
+			srv.cleanupDelay = 5 * time.Second
+			srv.heartbeatTimeout = 5 * time.Second
 			postJSON(t, ts.URL+"/api/operations/init", map[string]any{"operationId": "late", "userId": "user"}, http.StatusOK)
 			for _, eventType := range []string{"stream_chunk", "tool_execute"} {
 				postJSON(t, ts.URL+"/api/operations/push-event", map[string]any{
@@ -75,8 +78,175 @@ func TestLateWebSocketReplaysCompletedOperation(t *testing.T) {
 			if final.want == "resume_complete" && msg["status"] != final.status {
 				t.Fatalf("expected status %s, got %+v", final.status, msg)
 			}
+
+			ws.writeJSON(t, map[string]any{"type": "resume", "lastEventId": "1", "wantStatus": true})
+			if msg := ws.readJSON(t); msg["type"] != "resume_complete" || msg["gap"] != false || msg["status"] != final.status {
+				t.Fatalf("expected only the requested status after fallback, got %+v", msg)
+			}
 		})
 	}
+}
+
+func TestV1ReconnectRespectsResumeCursor(t *testing.T) {
+	for _, status := range []SessionStatus{StatusRunning, StatusCompleted} {
+		t.Run(string(status), func(t *testing.T) {
+			srv, ts := testServer()
+			defer ts.Close()
+			const operationID = "resume-cursor"
+			op := srv.getOrCreateOperation(operationID)
+			t.Cleanup(op.cleanup)
+			op.init(operationID, "user", nil)
+			op.pushEvent(agentStreamEvent{OperationID: operationID, Type: "stream_chunk"})
+			op.broadcastToolExecute(agentStreamEvent{OperationID: operationID, Type: "tool_execute"})
+			op.pushEvent(agentStreamEvent{OperationID: operationID, Type: "stream_chunk"})
+			if status == StatusCompleted {
+				op.updateStatus(status, "")
+			}
+
+			ws := dialWebSocket(t, ts.URL, "/ws?operationId="+operationID)
+			defer ws.close()
+			ws.writeJSON(t, map[string]any{"type": "auth", "token": "service-token"})
+			if msg := ws.readJSON(t); msg["type"] != "auth_success" {
+				t.Fatalf("expected auth_success, got %+v", msg)
+			}
+			ws.writeJSON(t, map[string]any{"type": "resume", "lastEventId": "1", "wantStatus": true})
+			if status == StatusRunning {
+				msg := ws.readJSON(t)
+				event, _ := msg["event"].(map[string]any)
+				if msg["type"] != "agent_event" || msg["id"] != "2" || event["type"] != "tool_execute" {
+					t.Fatalf("expected tool request for the running operation, got %+v", msg)
+				}
+			}
+			if msg := ws.readJSON(t); msg["type"] != "agent_event" || msg["id"] != "3" {
+				t.Fatalf("expected stream event after the resume cursor, got %+v", msg)
+			}
+			if status == StatusCompleted {
+				if msg := ws.readJSON(t); msg["type"] != "session_complete" || msg["id"] != "4" {
+					t.Fatalf("expected session_complete, got %+v", msg)
+				}
+			}
+			if msg := ws.readJSON(t); msg["type"] != "resume_complete" || msg["gap"] != false || msg["status"] != string(status) {
+				t.Fatalf("unexpected resume status: %+v", msg)
+			}
+		})
+	}
+}
+
+func TestLateTerminalReplayReportsGapBeforeCompletion(t *testing.T) {
+	srv, ts := testServer()
+	defer ts.Close()
+	srv.cleanupDelay = 5 * time.Second
+	srv.heartbeatTimeout = 5 * time.Second
+	const operationID = "terminal-gap"
+	op := srv.getOrCreateOperation(operationID)
+	t.Cleanup(op.cleanup)
+	op.init(operationID, "user", nil)
+	for range eventBufferMax - 1 {
+		op.pushEvent(agentStreamEvent{OperationID: operationID, Type: "stream_chunk"})
+	}
+	op.pushEvent(agentStreamEvent{OperationID: operationID, Type: "agent_runtime_end"})
+
+	ws := dialWebSocket(t, ts.URL, "/ws?operationId="+operationID)
+	defer ws.close()
+	ws.writeJSON(t, map[string]any{"type": "auth", "token": "service-token"})
+	if msg := ws.readJSON(t); msg["type"] != "auth_success" {
+		t.Fatalf("expected auth_success, got %+v", msg)
+	}
+	sawGap, sawChunk, sawRuntimeEnd := false, false, false
+	for range eventBufferTrim + 2 {
+		msg := ws.readJSON(t)
+		switch msg["type"] {
+		case "agent_event":
+			event, _ := msg["event"].(map[string]any)
+			if event["type"] == "agent_runtime_end" {
+				if !sawGap {
+					t.Fatal("runtime ended before the gap notice")
+				}
+				sawRuntimeEnd = true
+			} else {
+				sawChunk = true
+			}
+		case "resume_complete":
+			if msg["gap"] != true || msg["status"] != "completed" {
+				t.Fatalf("expected terminal replay gap, got %+v", msg)
+			}
+			sawGap = true
+		case "session_complete":
+			if !sawChunk || !sawGap || !sawRuntimeEnd {
+				t.Fatalf("incomplete terminal replay: chunks=%v gap=%v runtimeEnd=%v", sawChunk, sawGap, sawRuntimeEnd)
+			}
+			return
+		}
+	}
+	t.Fatal("terminal replay did not complete")
+}
+
+func TestPassiveTerminalReplaySurvivesCleanupDeadline(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ws, srv := terminalReplaySocket(t, terminalResumeGrace/2, time.Second)
+		defer ws.close()
+		ws.writeJSON(t, map[string]any{"type": "auth", "token": "service-token"})
+		if msg := ws.readJSON(t); msg["type"] != "auth_success" {
+			t.Fatalf("expected auth_success, got %+v", msg)
+		}
+		time.Sleep(terminalResumeGrace / 2)
+		synctest.Wait()
+		if srv.getOperation("terminal-replay") != nil {
+			t.Fatal("operation remains available after its cleanup deadline")
+		}
+		if msg := ws.readJSON(t); msg["type"] != "session_complete" {
+			t.Fatalf("expected terminal replay after cleanup, got %+v", msg)
+		}
+		if opcode, err := ws.br.ReadByte(); err != nil || opcode&0x0f != wsCloseMessage {
+			t.Fatalf("expected the expired connection to close after replay, got opcode %d, err %v", opcode&0x0f, err)
+		}
+	})
+}
+
+func TestSlowTerminalResumeDoesNotExpireHeartbeat(t *testing.T) {
+	const heartbeatTimeout = 50 * time.Millisecond
+	ws, _ := terminalReplaySocket(t, 5*time.Second, heartbeatTimeout)
+	defer ws.close()
+	ws.writeJSON(t, map[string]any{"type": "auth", "token": "service-token"})
+	if msg := ws.readJSON(t); msg["type"] != "auth_success" {
+		t.Fatalf("expected auth_success, got %+v", msg)
+	}
+	ws.writeJSON(t, map[string]any{"type": "resume", "lastEventId": "0", "wantStatus": true})
+	// net.Pipe holds the replay write until the client reads the first frame.
+	time.Sleep(2 * heartbeatTimeout)
+	if msg := ws.readJSON(t); msg["type"] != "session_complete" {
+		t.Fatalf("expected terminal replay, got %+v", msg)
+	}
+	if msg := ws.readJSON(t); msg["type"] != "resume_complete" {
+		t.Fatalf("expected replay status, got %+v", msg)
+	}
+	ws.writeJSON(t, map[string]any{"type": "heartbeat"})
+	if msg := ws.readJSON(t); msg["type"] != "heartbeat_ack" {
+		t.Fatalf("expected heartbeat after replay, got %+v", msg)
+	}
+}
+
+func terminalReplaySocket(t *testing.T, cleanupDelay, heartbeatTimeout time.Duration) (*testWS, *Server) {
+	t.Helper()
+	srv := NewServer(Config{ServiceToken: "service-token"})
+	srv.cleanupDelay = cleanupDelay
+	srv.heartbeatTimeout = heartbeatTimeout
+	const operationID = "terminal-replay"
+	op := srv.getOrCreateOperation(operationID)
+	op.init(operationID, "user", nil)
+	op.updateStatus(StatusCompleted, "")
+
+	server, client := net.Pipe()
+	_ = client.SetWriteDeadline(time.Now().Add(2 * time.Second))
+	t.Cleanup(func() {
+		_ = client.Close()
+		_ = server.Close()
+		op.cleanup()
+	})
+	conn := newOperationConnection(op, &wsConn{br: bufio.NewReader(server), conn: server})
+	op.register(conn)
+	go conn.readLoop()
+	return &testWS{br: bufio.NewReader(client), conn: client}, srv
 }
 
 type failingWriteConn struct{ net.Conn }
