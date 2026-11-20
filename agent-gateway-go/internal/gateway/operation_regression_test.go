@@ -86,36 +86,48 @@ func TestLateWebSocketReplaysCompletedOperation(t *testing.T) {
 	}
 }
 
-func TestTerminalReconnectRespectsResumeCursor(t *testing.T) {
-	srv, ts := testServer()
-	defer ts.Close()
-	const operationID = "terminal-resume"
-	op := srv.getOrCreateOperation(operationID)
-	t.Cleanup(op.cleanup)
-	op.init(operationID, "user", nil)
-	for range 2 {
-		op.pushEvent(agentStreamEvent{OperationID: operationID, Type: "stream_chunk"})
-	}
-	op.updateStatus(StatusCompleted, "")
+func TestV1ReconnectRespectsResumeCursor(t *testing.T) {
+	for _, status := range []SessionStatus{StatusRunning, StatusCompleted} {
+		t.Run(string(status), func(t *testing.T) {
+			srv, ts := testServer()
+			defer ts.Close()
+			const operationID = "resume-cursor"
+			op := srv.getOrCreateOperation(operationID)
+			t.Cleanup(op.cleanup)
+			op.init(operationID, "user", nil)
+			op.pushEvent(agentStreamEvent{OperationID: operationID, Type: "stream_chunk"})
+			op.broadcastToolExecute(agentStreamEvent{OperationID: operationID, Type: "tool_execute"})
+			op.pushEvent(agentStreamEvent{OperationID: operationID, Type: "stream_chunk"})
+			if status == StatusCompleted {
+				op.updateStatus(status, "")
+			}
 
-	ws := dialWebSocket(t, ts.URL, "/ws?operationId="+operationID)
-	defer ws.close()
-	ws.writeJSON(t, map[string]any{"type": "auth", "token": "service-token"})
-	if msg := ws.readJSON(t); msg["type"] != "auth_success" {
-		t.Fatalf("expected auth_success, got %+v", msg)
-	}
-	ws.writeJSON(t, map[string]any{"type": "resume", "lastEventId": "1", "wantStatus": true})
-	for _, want := range []struct{ eventType, id string }{
-		{"agent_event", "2"}, {"session_complete", "3"}, {"resume_complete", ""},
-	} {
-		msg := ws.readJSON(t)
-		id, _ := msg["id"].(string)
-		if msg["type"] != want.eventType || id != want.id {
-			t.Fatalf("expected %s (id %q), got %+v", want.eventType, want.id, msg)
-		}
-		if want.eventType == "resume_complete" && (msg["gap"] != false || msg["status"] != "completed") {
-			t.Fatalf("unexpected resume status: %+v", msg)
-		}
+			ws := dialWebSocket(t, ts.URL, "/ws?operationId="+operationID)
+			defer ws.close()
+			ws.writeJSON(t, map[string]any{"type": "auth", "token": "service-token"})
+			if msg := ws.readJSON(t); msg["type"] != "auth_success" {
+				t.Fatalf("expected auth_success, got %+v", msg)
+			}
+			ws.writeJSON(t, map[string]any{"type": "resume", "lastEventId": "1", "wantStatus": true})
+			if status == StatusRunning {
+				msg := ws.readJSON(t)
+				event, _ := msg["event"].(map[string]any)
+				if msg["type"] != "agent_event" || msg["id"] != "2" || event["type"] != "tool_execute" {
+					t.Fatalf("expected tool request for the running operation, got %+v", msg)
+				}
+			}
+			if msg := ws.readJSON(t); msg["type"] != "agent_event" || msg["id"] != "3" {
+				t.Fatalf("expected stream event after the resume cursor, got %+v", msg)
+			}
+			if status == StatusCompleted {
+				if msg := ws.readJSON(t); msg["type"] != "session_complete" || msg["id"] != "4" {
+					t.Fatalf("expected session_complete, got %+v", msg)
+				}
+			}
+			if msg := ws.readJSON(t); msg["type"] != "resume_complete" || msg["gap"] != false || msg["status"] != string(status) {
+				t.Fatalf("unexpected resume status: %+v", msg)
+			}
+		})
 	}
 }
 

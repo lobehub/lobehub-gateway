@@ -327,8 +327,12 @@ func (o *operation) handleResume(conn *operationConnection, lastEventID string, 
 	// opt-in client treats "no resume_complete" as "keep waiting" — live events
 	// still stream and heartbeat loss still forces reconnect — which is safe
 	// and recoverable. See LOBE-10443.
+	terminal := isTerminalStatus(status)
 	for _, payload := range payloads {
-		if !isMuxOnlyPayload(payload) && o.llmRecipient(conn, payload) && !conn.writeOrClose(payload) {
+		if skipV1ReplayPayload(payload, terminal) || !o.llmRecipient(conn, payload) {
+			continue
+		}
+		if !conn.writeOrClose(payload) {
 			return
 		}
 	}
@@ -362,8 +366,7 @@ func (o *operation) replayFinished(conn *operationConnection, userID string) boo
 		}
 		switch message.Type {
 		case "agent_event":
-			switch message.Event.Type {
-			case "message_patch", "tool_execute":
+			if skipV1ReplayEvent(message.Event.Type, true) {
 				continue
 			}
 		case "session_complete":
@@ -1008,14 +1011,19 @@ func mustMarshal(value any) []byte {
 	return payload
 }
 
-func isMuxOnlyPayload(payload json.RawMessage) bool {
+func skipV1ReplayPayload(payload json.RawMessage, terminal bool) bool {
 	var message struct {
 		Event *struct {
 			Type string `json:"type"`
 		} `json:"event"`
 		Type string `json:"type"`
 	}
-	return json.Unmarshal(payload, &message) == nil && message.Type == "agent_event" && message.Event != nil && message.Event.Type == "message_patch"
+	return json.Unmarshal(payload, &message) == nil && message.Type == "agent_event" &&
+		message.Event != nil && skipV1ReplayEvent(message.Event.Type, terminal)
+}
+
+func skipV1ReplayEvent(eventType string, terminal bool) bool {
+	return eventType == "message_patch" || (terminal && eventType == "tool_execute")
 }
 
 func parseEventID(value string) int {
