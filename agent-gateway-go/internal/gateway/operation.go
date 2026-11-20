@@ -20,6 +20,8 @@ const (
 	eventBufferTrim      = 500
 	eventBufferMaxBytes  = 16 << 20
 	eventBufferTrimBytes = eventBufferMaxBytes / 2
+
+	terminalResumeGrace = 750 * time.Millisecond
 )
 
 type queuedHubEvent struct {
@@ -331,52 +333,61 @@ func (o *operation) handleResume(conn *operationConnection, lastEventID string, 
 		}
 	}
 	if wantStatus && status != "" {
-		conn.writeOrClose(mustMarshal(map[string]any{
-			"gap":    gap,
-			"status": status,
-			"type":   "resume_complete",
-		}))
+		conn.writeResumeComplete(gap, status)
 	}
 }
 
 // A v1 client that connects after completion may never send a resume request.
-func (o *operation) replayFinished(conn *operationConnection, userID string) {
+func (o *operation) replayFinished(conn *operationConnection, userID string) bool {
 	o.mu.Lock()
-	if o.record.UserID != userID || !isTerminalStatus(o.record.Status) {
+	if _, attached := o.connections[conn]; !attached || o.record.UserID != userID || !isTerminalStatus(o.record.Status) {
 		o.mu.Unlock()
-		return
+		return false
 	}
 	payloads, gap, status := o.collectReplayLocked(0)
+	operationID := o.record.OperationID
 	o.mu.Unlock()
+
+	gapReported := false
 	for _, payload := range payloads {
 		var message struct {
 			Type  string `json:"type"`
 			Event struct {
-				Type string `json:"type"`
+				Type        string `json:"type"`
+				OperationID string `json:"operationId"`
 			} `json:"event"`
 		}
 		if json.Unmarshal(payload, &message) != nil {
 			continue
 		}
-		// Replay stream history and the terminal signal, skipping dispatch
-		// requests that no longer have a waiting operation.
 		switch message.Type {
-		case "session_complete":
-			conn.writeOrClose(payload)
-			return
 		case "agent_event":
 			switch message.Event.Type {
 			case "message_patch", "tool_execute":
 				continue
 			}
-			if !conn.writeOrClose(payload) {
-				return
+		case "session_complete":
+		default:
+			continue
+		}
+
+		terminal := message.Type == "session_complete" ||
+			(message.Event.Type == "agent_runtime_end" &&
+				(message.Event.OperationID == "" || message.Event.OperationID == operationID))
+		if terminal && gap && !gapReported {
+			if !conn.writeResumeComplete(true, status) {
+				return false
 			}
+			gapReported = true
+		}
+		if !conn.writeOrClose(payload) {
+			return false
+		}
+		if message.Type == "session_complete" {
+			return true
 		}
 	}
-	conn.writeOrClose(mustMarshal(map[string]any{
-		"gap": gap, "status": status, "type": "resume_complete",
-	}))
+	return gapReported || conn.writeResumeComplete(gap, status)
 }
 
 func (o *operation) collectReplay(lastEventID string) ([]json.RawMessage, bool, SessionStatus) {
@@ -404,11 +415,14 @@ func (o *operation) collectReplayLocked(since int) ([]json.RawMessage, bool, Ses
 		}
 	}
 	sort.SliceStable(payloads, func(i, j int) bool { return messageID(payloads[i]) < messageID(payloads[j]) })
-	gap := o.eventCounter > since
-	if len(o.eventBuffer) > 0 {
-		gap = parseEventID(o.eventBuffer[0].ID) > since+1
+	return payloads, o.replayGapLocked(since), o.record.Status
+}
+
+func (o *operation) replayGapLocked(since int) bool {
+	if len(o.eventBuffer) == 0 {
+		return o.eventCounter > since
 	}
-	return payloads, gap, o.record.Status
+	return since < parseEventID(o.eventBuffer[0].ID)-1
 }
 
 func (o *operation) hubSnapshot() (string, SessionStatus, *operationMeta) {
@@ -696,6 +710,11 @@ type operationConnection struct {
 	mu             sync.RWMutex
 	operation      *operation
 	ws             *wsConn
+
+	// Owned by the read loop. The timer sends its result before a late
+	// resume can decide whether any history still needs to be replayed.
+	terminalReplayTimer *time.Timer
+	terminalReplayDone  chan bool
 }
 
 func newOperationConnection(op *operation, ws *wsConn) *operationConnection {
@@ -760,6 +779,12 @@ func (c *operationConnection) writeJSON(v any) error {
 	return c.writeRaw(payload)
 }
 
+func (c *operationConnection) writeResumeComplete(gap bool, status SessionStatus) bool {
+	return c.writeOrClose(mustMarshal(map[string]any{
+		"gap": gap, "status": status, "type": "resume_complete",
+	}))
+}
+
 func (c *operationConnection) writeRaw(payload []byte) error {
 	return c.ws.writeJSON(payload)
 }
@@ -812,6 +837,11 @@ func (c *operationConnection) stopTimers() {
 
 func (c *operationConnection) readLoop() {
 	defer c.operation.remove(c)
+	defer func() {
+		if c.terminalReplayTimer != nil {
+			c.terminalReplayTimer.Stop()
+		}
+	}()
 
 	for {
 		payload, err := c.ws.readMessage()
@@ -867,10 +897,14 @@ func (c *operationConnection) handleAuth(payload []byte) {
 	if !c.writeOrClose(mustMarshal(map[string]string{"type": "auth_success"})) {
 		return
 	}
-	if finished {
-		c.operation.replayFinished(c, verifiedUserID)
-	}
 	c.startHeartbeatTimer(c.operation.server.heartbeatTimeout)
+	if finished {
+		done := make(chan bool, 1)
+		c.terminalReplayDone = done
+		c.terminalReplayTimer = time.AfterFunc(terminalResumeGrace, func() {
+			done <- c.operation.replayFinished(c, verifiedUserID)
+		})
+	}
 }
 
 func (c *operationConnection) verifyPendingOwner(userID string) {
@@ -896,9 +930,25 @@ func (c *operationConnection) handleAuthenticatedMessage(messageType string, pay
 			LastEventID string `json:"lastEventId"`
 			WantStatus  bool   `json:"wantStatus"`
 		}
-		if json.Unmarshal(payload, &msg) == nil {
-			c.operation.handleResume(c, msg.LastEventID, msg.WantStatus)
+		if json.Unmarshal(payload, &msg) != nil {
+			return
 		}
+		if timer := c.terminalReplayTimer; timer != nil {
+			c.terminalReplayTimer = nil
+			if !timer.Stop() && <-c.terminalReplayDone {
+				if msg.WantStatus {
+					c.operation.mu.RLock()
+					gap := c.operation.replayGapLocked(parseEventID(msg.LastEventID))
+					status := c.operation.record.Status
+					c.operation.mu.RUnlock()
+					if status != "" {
+						c.writeResumeComplete(gap, status)
+					}
+				}
+				return
+			}
+		}
+		c.operation.handleResume(c, msg.LastEventID, msg.WantStatus)
 	case "heartbeat":
 		c.recordHeartbeat()
 		c.resetHeartbeatTimer(c.operation.server.heartbeatTimeout)
