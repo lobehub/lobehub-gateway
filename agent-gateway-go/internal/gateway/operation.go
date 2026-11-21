@@ -24,6 +24,16 @@ const (
 	terminalResumeGrace = 750 * time.Millisecond
 )
 
+// Reasons sent to LobeHub's finalize-abandoned endpoint. They are recorded on
+// the abandoned operation, so each names the path that gave up on the run.
+const (
+	// The run stayed silent for the whole inactivity window.
+	finalizeReasonWatchdog = "inactivity_watchdog"
+	// The watchdog's verdict never reached LobeHub; cleanup delivers it before
+	// the operation leaves memory.
+	finalizeReasonCleanup = "gateway_cleanup"
+)
+
 type queuedHubEvent struct {
 	delivered     chan int
 	isToolExecute bool
@@ -43,23 +53,37 @@ type pendingInput struct {
 type operation struct {
 	server *Server
 
+	cleanupDue       time.Time
 	cleanupTimer     *time.Timer
 	connections      map[*operationConnection]struct{}
 	eventBuffer      []bufferedEvent
 	eventBufferBytes int
 	eventCounter     int
 	expired          bool
-	hubDispatch      bool
-	hubOverflow      bool
-	hubQueue         []queuedHubEvent
-	lastEventAt      time.Time
-	lastEventTyp     string
-	mu               sync.RWMutex
-	pendingConf      map[string]pendingConfirmation
-	pendingInput     map[string]pendingInput
-	record           operationRecord
-	watchdog         *time.Timer
-	openLLM          map[string]openLLMCall
+	// finalizeOwed is set when the watchdog declared the run dead but LobeHub
+	// never acknowledged finalize-abandoned. The row is still live there, so
+	// cleanup must deliver the verdict before the operation leaves memory.
+	finalizeOwed bool
+	hubDispatch  bool
+	hubOverflow  bool
+	hubQueue     []queuedHubEvent
+	lastEventAt  time.Time
+	lastEventTyp string
+	mu           sync.RWMutex
+	pendingConf  map[string]pendingConfirmation
+	pendingInput map[string]pendingInput
+	record       operationRecord
+	// reopenedThrough is the last event ID from before the operation last
+	// reopened. A session_complete at or below it was superseded by the run
+	// going on, so terminal replay must not stop there.
+	reopenedThrough int
+	// runSettled reports whether the latest session end also ended the run on
+	// LobeHub. A terminal mirrored from another operation ends the session
+	// while the run goes on; only such an unsettled end can be revived by
+	// later work. See reviveLocked.
+	runSettled bool
+	watchdog   *time.Timer
+	openLLM    map[string]openLLMCall
 }
 
 func newOperation(server *Server, operationID string) *operation {
@@ -94,6 +118,9 @@ func (o *operation) init(operationID string, userID string, meta *operationMeta)
 	if o.record.CreatedAt.IsZero() {
 		o.record.CreatedAt = time.Now()
 	}
+	o.finalizeOwed = false
+	o.reopenedThrough = o.eventCounter
+	o.runSettled = false
 	o.stopCleanupLocked()
 	o.lastEventAt = time.Now()
 	o.lastEventTyp = "operation_init"
@@ -158,10 +185,14 @@ func (o *operation) pushEvent(event agentStreamEvent) {
 	payload := o.bufferLocked(id, msg)
 	o.lastEventAt = time.Now()
 	o.lastEventTyp = event.Type
+	revived := isRunWorkEvent(event.Type) && o.reviveLocked()
 	o.scheduleWatchdogLocked()
 	connections := o.authenticatedConnectionsLocked()
 	o.queueHubEventLocked(msg)
 	o.mu.Unlock()
+	if revived {
+		o.server.notifyLifecycle(o, StatusRunning, "")
+	}
 	if event.Type != "message_patch" {
 		broadcast(connections, payload)
 	}
@@ -179,11 +210,68 @@ func (o *operation) broadcastToolExecute(event agentStreamEvent) {
 	payload := o.bufferLocked(id, msg)
 	o.lastEventAt = time.Now()
 	o.lastEventTyp = event.Type
+	revived := o.reviveLocked()
 	o.scheduleWatchdogLocked()
 	connections := o.authenticatedConnectionsLocked()
 	o.queueHubEventLocked(msg)
 	o.mu.Unlock()
+	if revived {
+		o.server.notifyLifecycle(o, StatusRunning, "")
+	}
 	broadcast(connections, payload)
+}
+
+// isRunWorkEvent reports whether an event shows a run executing: a step, an
+// LLM stream or a tool starting. Producers emit these only while a step runs,
+// so they are what may reopen an operation whose session ended (see
+// reviveLocked); bookkeeping events such as message patches never do.
+func isRunWorkEvent(eventType string) bool {
+	switch eventType {
+	case "step_start", "stream_start", "tool_start":
+		return true
+	}
+	return false
+}
+
+// reviveLocked reopens an operation whose session ended while its run went
+// on, once the run shows it is executing again.
+//
+// That happens when a run's terminal is mirrored onto another operation's
+// channel: a group member's onto its supervisor's, or a delegated
+// heterogeneous run's onto the topic run that started it. Unless the client
+// that started the channel declared it handles `member_runtime_end`, LobeHub
+// forwards the terminal verbatim, so it ended the channel's session while the
+// channel's own run kept going: the watchdog stopped, later steps did not
+// restart it, and cleanup dropped the operation mid-run. A run that then died
+// between steps stayed `running` on LobeHub forever. Headless runs (bots,
+// channels) never declare it. Reopening restores the normal rules: no
+// cleanup while the run is live, and the watchdog reports it if it goes
+// silent.
+//
+// A settled end (the channel's own run finished) is never reopened, so late
+// events cannot bring a finished run back, and neither is an operation cleanup
+// already retired. Returns whether it reopened.
+func (o *operation) reviveLocked() bool {
+	if o.expired || !isTerminalStatus(o.record.Status) || o.runSettled {
+		return false
+	}
+	o.record.Status = StatusRunning
+	o.reopenedThrough = o.eventCounter
+	// A verdict LobeHub never received is void: the run is demonstrably alive.
+	o.finalizeOwed = false
+	o.stopCleanupLocked()
+	return true
+}
+
+// runOpenLocked reports whether the run may still be live on LobeHub with
+// nothing else going to report it, which is what the watchdog is for. That
+// covers a session ended only by a mirrored terminal: if the channel's own run
+// dies before its next step, no further event will ever arrive.
+func (o *operation) runOpenLocked() bool {
+	if o.expired {
+		return false
+	}
+	return !isTerminalStatus(o.record.Status) || (!o.runSettled && !o.finalizeOwed)
 }
 
 func (o *operation) handleAgentRuntimeEnd(event agentStreamEvent) {
@@ -195,19 +283,38 @@ func (o *operation) handleAgentRuntimeEnd(event agentStreamEvent) {
 	} else if data.Reason == "interrupted" {
 		status = StatusInterrupted
 	}
-	o.handleSessionEnd(status, data.ReasonDetail)
+	o.handleSessionEnd(status, data.ReasonDetail, event.OperationID)
 }
 
-func (o *operation) handleSessionEnd(status SessionStatus, summary string) {
+// runEndSettles reports whether an agent_runtime_end delivered on an
+// operation's channel ends that operation's run, or only its session. Clients
+// get `session_complete` either way, but an end naming another operation is a
+// mirrored terminal (see reviveLocked) and the channel's own run goes on. An
+// end without an operationId predates the field and keeps its final meaning.
+func runEndSettles(channelOperationID string, endedOperationID string) bool {
+	return endedOperationID == "" || endedOperationID == channelOperationID
+}
+
+func (o *operation) handleSessionEnd(status SessionStatus, summary string, endedOperationID string) {
 	msg := map[string]any{"summary": summary, "type": "session_complete"}
 	o.mu.Lock()
 	o.record.Status = status
+	// A mirrored end says nothing about this run: it cannot unsettle a run that
+	// already finished, or void a verdict LobeHub is still owed.
+	if runEndSettles(o.record.OperationID, endedOperationID) {
+		o.runSettled = true
+		o.finalizeOwed = false
+	}
 	id := o.nextEventIDLocked()
 	msg["id"] = id
 	payload := o.bufferLocked(id, msg)
 	connections := o.authenticatedConnectionsLocked()
 	o.queueHubEventLocked(msg)
-	o.scheduleCleanupLocked()
+	if o.runOpenLocked() {
+		o.scheduleWatchdogLocked()
+	} else {
+		o.scheduleCleanupLocked()
+	}
 	o.mu.Unlock()
 	broadcast(connections, payload)
 	o.server.notifyLifecycle(o, status, summary)
@@ -215,8 +322,12 @@ func (o *operation) handleSessionEnd(status SessionStatus, summary string) {
 
 func (o *operation) updateStatus(status SessionStatus, summary string) {
 	o.mu.Lock()
+	reopened := isTerminalStatus(o.record.Status) && !isTerminalStatus(status)
 	o.record.Status = status
 	id := o.nextEventIDLocked()
+	if reopened {
+		o.reopenedThrough = o.eventCounter
+	}
 	var msg map[string]any
 	if status == StatusCompleted {
 		msg = map[string]any{"id": id, "summary": summary, "type": "session_complete"}
@@ -227,6 +338,14 @@ func (o *operation) updateStatus(status SessionStatus, summary string) {
 	o.queueHubEventLocked(msg)
 	o.lastEventAt = time.Now()
 	o.lastEventTyp = "status_change"
+	// The backend states the run's state itself: a terminal status settles it
+	// with nothing left to finalize, and any other status means it is live,
+	// whatever ended the session before.
+	o.finalizeOwed = false
+	o.runSettled = isTerminalStatus(status)
+	if !o.runSettled {
+		o.stopCleanupLocked()
+	}
 	o.scheduleWatchdogLocked()
 	connections := o.authenticatedConnectionsLocked()
 	if isTerminalStatus(status) {
@@ -351,6 +470,7 @@ func (o *operation) replayFinished(conn *operationConnection, userID string) boo
 	}
 	payloads, gap, status := o.collectReplayLocked(0)
 	operationID := o.record.OperationID
+	reopenedThrough := o.reopenedThrough
 	o.mu.Unlock()
 
 	gapReported := false
@@ -371,6 +491,11 @@ func (o *operation) replayFinished(conn *operationConnection, userID string) boo
 				continue
 			}
 		case "session_complete":
+			// The run went on past this one (a mirrored end), so it is neither
+			// the terminal to report a gap before nor the end of the history.
+			if messageID(payload) <= reopenedThrough {
+				continue
+			}
 		default:
 			continue
 		}
@@ -531,7 +656,7 @@ func (o *operation) authenticatedConnectionsLocked() []*operationConnection {
 }
 
 func (o *operation) scheduleWatchdogLocked() {
-	if o.lastEventAt.IsZero() || isTerminalStatus(o.record.Status) {
+	if o.lastEventAt.IsZero() || !o.runOpenLocked() {
 		return
 	}
 	timeout := o.watchdogTimeoutLocked()
@@ -549,7 +674,7 @@ func (o *operation) scheduleWatchdogLocked() {
 
 func (o *operation) fireWatchdog() {
 	o.mu.Lock()
-	if o.lastEventAt.IsZero() || isTerminalStatus(o.record.Status) {
+	if o.lastEventAt.IsZero() || !o.runOpenLocked() {
 		o.mu.Unlock()
 		return
 	}
@@ -563,9 +688,10 @@ func (o *operation) fireWatchdog() {
 	operationID := o.record.OperationID
 	o.mu.Unlock()
 
-	result, ok := o.callFinalizeAbandoned(operationID, "inactivity_watchdog")
+	result, err := o.callFinalizeAbandoned(operationID, finalizeReasonWatchdog)
+	acknowledged := err == nil
 	abandoned := true
-	if ok {
+	if acknowledged {
 		if result.Abandoned != nil {
 			abandoned = *result.Abandoned
 		} else {
@@ -574,7 +700,7 @@ func (o *operation) fireWatchdog() {
 	}
 
 	o.mu.Lock()
-	if isTerminalStatus(o.record.Status) {
+	if !o.runOpenLocked() {
 		o.mu.Unlock()
 		return
 	}
@@ -586,6 +712,19 @@ func (o *operation) fireWatchdog() {
 	if time.Since(o.lastEventAt) < currentTimeout {
 		o.scheduleWatchdogLocked()
 		o.mu.Unlock()
+		return
+	}
+	// The run is over either way, but only an acknowledged call settled it on
+	// LobeHub. Otherwise its row is still live there, and cleanup owes it the
+	// verdict.
+	o.runSettled = acknowledged
+	o.finalizeOwed = !acknowledged
+	if isTerminalStatus(o.record.Status) {
+		// A mirrored end already gave clients their session_complete; this
+		// verdict is for LobeHub, so they get no second terminal.
+		o.scheduleCleanupLocked()
+		o.mu.Unlock()
+		o.warnUnacknowledgedFinalize(operationID, err)
 		return
 	}
 	summary := watchdogSummary(idle)
@@ -606,37 +745,49 @@ func (o *operation) fireWatchdog() {
 	o.queueHubEventLocked(msg)
 	o.scheduleCleanupLocked()
 	o.mu.Unlock()
+	o.warnUnacknowledgedFinalize(operationID, err)
 	broadcast(connections, payload)
 	o.server.notifyLifecycle(o, status, summary)
 }
 
-func (o *operation) callFinalizeAbandoned(operationID string, reason string) (finalizeAbandonedResult, bool) {
+func (o *operation) warnUnacknowledgedFinalize(operationID string, err error) {
+	if err == nil {
+		return
+	}
+	o.server.logger.Warn("finalize-abandoned failed; retrying when the operation is cleaned up",
+		"operationId", operationID, "reason", finalizeReasonWatchdog, "error", err)
+}
+
+// callFinalizeAbandoned asks LobeHub to finalize a run the gateway gave up on.
+// Any error means LobeHub did not acknowledge it, so its row may still read
+// `running`.
+func (o *operation) callFinalizeAbandoned(operationID string, reason string) (finalizeAbandonedResult, error) {
 	if operationID == "" {
-		return finalizeAbandonedResult{}, false
+		return finalizeAbandonedResult{}, errors.New("missing operationId")
 	}
 	body, _ := json.Marshal(map[string]string{"operationId": operationID, "reason": reason})
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, normalizeBaseURL(o.server.cfg.LobeAPIBaseURL)+"/api/agent/finalize-abandoned", bytes.NewReader(body))
 	if err != nil {
-		return finalizeAbandonedResult{}, false
+		return finalizeAbandonedResult{}, err
 	}
 	req.Header.Set("Authorization", "Bearer "+o.server.cfg.ServiceToken)
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return finalizeAbandonedResult{}, false
+		return finalizeAbandonedResult{}, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		_, _ = io.Copy(io.Discard, resp.Body)
-		return finalizeAbandonedResult{}, false
+		detail, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return finalizeAbandonedResult{}, fmt.Errorf("finalize-abandoned returned %d: %s", resp.StatusCode, bytes.TrimSpace(detail))
 	}
 	var result finalizeAbandonedResult
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return finalizeAbandonedResult{}, false
+		return finalizeAbandonedResult{}, fmt.Errorf("decode finalize-abandoned response: %w", err)
 	}
-	return result, true
+	return result, nil
 }
 
 func boolValue(value *bool) bool {
@@ -668,6 +819,7 @@ func (o *operation) forwardToolResult(msg toolResultMessage) {
 
 func (o *operation) scheduleCleanupLocked() {
 	o.stopWatchdogLocked()
+	o.cleanupDue = time.Now().Add(o.server.cleanupDelay)
 	if o.cleanupTimer == nil {
 		o.cleanupTimer = time.AfterFunc(o.server.cleanupDelay, o.cleanup)
 		return
@@ -675,9 +827,15 @@ func (o *operation) scheduleCleanupLocked() {
 	o.cleanupTimer.Reset(o.server.cleanupDelay)
 }
 
+// cleanup drops an ended operation from memory. It is the last point at which
+// the gateway knows the operation, so it first settles anything still owed to
+// LobeHub: once the operation is gone, nothing here can finalize its run.
 func (o *operation) cleanup() {
 	o.mu.Lock()
-	if o.expired {
+	if o.expired || o.cleanupDue.IsZero() || time.Now().Before(o.cleanupDue) {
+		// Already retired, or a stale firing: the operation was revived (or
+		// ended again) while this call waited for the lock. A live run belongs
+		// to its watchdog; a rescheduled cleanup fires on its own.
 		o.mu.Unlock()
 		return
 	}
@@ -692,10 +850,15 @@ func (o *operation) cleanup() {
 	}
 	o.stopWatchdogLocked()
 	o.stopCleanupLocked()
+	owed := o.finalizeOwed
+	o.finalizeOwed = false
 	operationID := o.record.OperationID
 	o.mu.Unlock()
 
 	// Retire the operation without waiting for terminal recovery to finish.
+	if owed {
+		o.settleOwedFinalize(operationID)
+	}
 	o.server.notifyLifecycle(o, "gone", "")
 	o.server.removeOperation(operationID, o)
 	for _, conn := range connections {
@@ -718,7 +881,22 @@ func (o *operation) finishTerminalReplay(c *operationConnection) {
 	}
 }
 
+// settleOwedFinalize retries a watchdog verdict LobeHub never acknowledged.
+// After this the operation leaves memory, so a failure is reported loudly:
+// the run stays `running` on LobeHub until its own stale-operation sweep
+// retires it.
+func (o *operation) settleOwedFinalize(operationID string) {
+	if _, err := o.callFinalizeAbandoned(operationID, finalizeReasonCleanup); err != nil {
+		o.server.logger.Error("finalize-abandoned failed during cleanup; the run may stay running on LobeHub",
+			"operationId", operationID, "reason", finalizeReasonCleanup, "error", err)
+		return
+	}
+	o.server.logger.Info("finalized abandoned operation during cleanup",
+		"operationId", operationID, "reason", finalizeReasonCleanup)
+}
+
 func (o *operation) stopCleanupLocked() {
+	o.cleanupDue = time.Time{}
 	if o.cleanupTimer != nil {
 		o.cleanupTimer.Stop()
 		o.cleanupTimer = nil

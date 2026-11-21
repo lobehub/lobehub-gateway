@@ -49,11 +49,15 @@ v2 协议在 `/v2/ws` upgrade 时完成认证。`token` 必填；`tokenType` 默
 
 `POST /api/operations/init` 可携带 `topicId`、`threadId`、`agentId`、`groupId`、`taskId`、`scope`、`parentOperationId`、`mirrorToOperationId`、`rootOperationId` 和 `heteroType` 元数据。v2 连接会收到用户级 `op_lifecycle` 消息，其中包含这些元数据与 operation 的精确状态。未知元数据字段会被忽略。
 
-`llm-execute` 接受 `{ operationId, data: { callId, preferredClientId?, deadlines?: { totalMs? }, ... } }`，将请求数据原样包装为 `llm_execute` 类型的 `agent_event`。v1 客户端在 `auth` 消息中提供 `clientId`，v2 使用连接查询参数中的 `clientId`。优先投递给 `preferredClientId` 指定的发起端；发起端缺席时，v2 优先选择 executor 订阅，再退回所有订阅者，v1 退回所有已认证客户端。成功返回 `{ success: true, delivered }`；已结束的 operation 返回 `409 { delivered: 0, error: "OPERATION_ENDED" }`。
+`llm-execute` 接受 `{ operationId, data: { callId, preferredClientId?, deadlines?: { totalMs? }, ... } }`，将请求数据原样包装为 `llm_execute` 类型的 `agent_event`。v1 客户端在 `auth` 消息中提供 `clientId`，v2 使用连接查询参数中的 `clientId`。优先投递给 `preferredClientId` 指定的发起端；发起端缺席时，v2 优先选择 executor 订阅，再退回所有订阅者，v1 退回所有已认证客户端。成功返回 `{ success: true, delivered }`；run 已结束的 operation 返回 `409 { delivered: 0, error: "OPERATION_ENDED" }`。因镜像终止事件而结束 session 的 operation 会接受该请求并重新打开，见下文。
 
 `llm-cancel` 接受 `{ operationId, data: { callId, ... } }`，向所有客户端广播 `llm_cancel`。`llm-close` 接受 `{ operationId, callId }`，停止重放该请求且不广播。Resume 只重放尚未结束、尚未过期的请求，包括已被事件环形缓冲区裁剪的请求，投递对象与实时事件一致。默认重放有效期为 10 分钟，可通过正数 `data.deadlines.totalMs` 指定。取消、关闭或 operation 结束后不再重放执行请求；进程重启会丢失未结束的请求。
 
-空闲看门狗从 operation 初始化时启动，每次后端活动刷新固定的 30 分钟窗口；`init.meta.heteroType` 非空时为 60 分钟。事件类型不会改变窗口长度。异常终止核对通过 `LOBE_API_BASE_URL` 回调应用服务。
+空闲看门狗从 operation 初始化时启动，每次后端活动刷新固定的 30 分钟窗口；`init.meta.heteroType` 非空时为 60 分钟。事件类型不会改变窗口长度。窗口到期时，网关以 reason `inactivity_watchdog` 调用 `LOBE_API_BASE_URL` 上的 `POST /api/agent/finalize-abandoned`。
+
+每个 `agent_runtime_end` 都会结束 session：客户端收到 `session_complete`。指向本 operation（或未指定 operation）的 end 同时结束它的 run，operation 在 10 分钟后从内存移除。指向另一个 operation 的 end 是镜像到本频道的终止事件（例如群组成员的终止事件镜像到 supervisor 频道），本频道自己的 run 仍在继续，因此 operation 留在内存中并继续受看门狗监控。之后收到 `step_start`、`stream_start`、`tool_start` 事件、`tool-execute`、`llm-execute` 或非终态的 `update-status` 时，它回到 `running`。其他事件只刷新空闲窗口，不会重新打开它。如果窗口先到期，网关调用 `finalize-abandoned`，不再向客户端发送第二个终止事件，并在 10 分钟后移除 operation。
+
+若 LobeHub 没有确认看门狗的调用（网络错误、非 2xx 响应或响应无法解析），网关记录 warning，并在 operation 从内存移除前以 reason `gateway_cleanup` 重试一次；重试失败记录为 error。run 已结束或看门狗调用已被确认的 operation 不会再次 finalize。看门狗状态只保存在内存中，网关重启时正在运行的 operation 不会由网关 finalize，由 LobeHub 的 stale-operation sweep 退役。
 
 ## 配置
 
