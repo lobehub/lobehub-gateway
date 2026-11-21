@@ -3,6 +3,7 @@ package gateway
 import (
 	"encoding/json"
 	"io"
+	"log/slog"
 	"net/http"
 	"strings"
 	"sync"
@@ -25,6 +26,7 @@ type Server struct {
 	cfg              Config
 	cleanupDelay     time.Duration
 	heartbeatTimeout time.Duration
+	logger           *slog.Logger
 	operations       map[string]*operation
 	operationsMu     sync.Mutex
 	v2Connections    map[*hubConnection]struct{}
@@ -38,6 +40,7 @@ func NewServer(cfg Config) *Server {
 		cfg:              cfg,
 		cleanupDelay:     defaultCleanupDelay,
 		heartbeatTimeout: defaultHeartbeatTimeout,
+		logger:           slog.Default(),
 		operations:       map[string]*operation{},
 		v2Connections:    map[*hubConnection]struct{}{},
 	}

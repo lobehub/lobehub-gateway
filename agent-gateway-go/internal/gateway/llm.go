@@ -118,10 +118,17 @@ func (s *Server) handleLLM(w http.ResponseWriter, r *http.Request, body operatio
 	}
 	op := s.getOrCreateOperation(body.OperationID)
 	op.mu.Lock()
-	if r.URL.Path == "/api/operations/llm-execute" && isTerminalStatus(op.record.Status) {
-		op.mu.Unlock()
-		writeJSON(w, 409, map[string]any{"delivered": 0, "error": "OPERATION_ENDED"})
-		return
+	revived := false
+	if r.URL.Path == "/api/operations/llm-execute" {
+		// An LLM attempt is a step running: it reopens a run whose session
+		// ended on a mirrored terminal (see reviveLocked). A finished run
+		// still refuses it.
+		revived = op.reviveLocked()
+		if isTerminalStatus(op.record.Status) {
+			op.mu.Unlock()
+			writeJSON(w, 409, map[string]any{"delivered": 0, "error": "OPERATION_ENDED"})
+			return
+		}
 	}
 	delete(op.openLLM, callID)
 	if closing {
@@ -152,6 +159,9 @@ func (s *Server) handleLLM(w http.ResponseWriter, r *http.Request, body operatio
 	}
 	hubDelivered := op.queueHubEventLocked(message)
 	op.mu.Unlock()
+	if revived {
+		s.notifyLifecycle(op, StatusRunning, "")
+	}
 	delivered := 0
 	for _, conn := range connections {
 		if conn.writeJSON(message) == nil && !conn.isAdmin() {
